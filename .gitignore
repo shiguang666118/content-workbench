@@ -1,0 +1,15 @@
+state/
+__pycache__/
+*.pyc
+
+# 知识库里的媒体文件不进 Git
+vault/**/*.mp4
+vault/**/*.m4a
+vault/**/*.wav
+vault/**/*.jpg
+vault/**/*.png
+vault/.obsidian/workspace.json
+
+# 你自己的密钥（放在 state/ 里本来就不进 Git，这里再兜一层）
+tikhub.json
+feishu.json

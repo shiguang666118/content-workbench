@@ -1,0 +1,3277 @@
+#!/usr/bin/env python3
+"""Ray's Brain 本地知识仪表盘。
+
+只监听本机回环地址。Markdown 仍是唯一数据源；仪表盘提供读取、灵感追加、
+审核卡勾选，以及按 board_protocol.json 声明的可撤回状态流转与候选立项。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import ipaddress
+import json
+import os
+import re
+import socket
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import webbrowser
+from collections import Counter
+from datetime import date, datetime, timedelta
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import obsidian_views  # noqa: E402  同目录模块，按文件路径加载时也要能找到
+
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from vault_layout import DEFAULT_LAYOUT, load_layout
+
+LAYOUT = load_layout()
+
+HERE = Path(__file__).resolve().parent
+DASHBOARD_SCHEMA_VERSION = 8
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# Surge Ponte 把 <设备名>.sgponte 在本机解析到 127.0.0.1，流量经 Ponte 隧道到达回环地址；
+# 能发起连接的只有同一 iCloud 账号下跑着 Surge 的自有设备，因此该后缀与本机地址同级放行。
+PONTE_SUFFIX = ".sgponte"
+# --tailnet 开启后加入本机的 Tailscale 地址与 MagicDNS 名；默认空集，行为与纯本机一致。
+EXTRA_ALLOWED_HOSTS: set[str] = set()
+TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+TAILSCALE_CLI_CANDIDATES = ((shutil.which("tailscale") or "tailscale.exe"),) if os.name == "nt" else (
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+)
+SERVER_STARTED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
+DEFAULT_VAULT = HERE.parents[2]
+VAULT = Path(os.environ.get("RAYS_BRAIN", str(DEFAULT_VAULT))).resolve()
+STATIC_DIR = HERE / "static"
+REVIEW_PROTOCOL_FILE = HERE.parent / "review_protocol.json"
+BOARD_PROTOCOL_FILE = HERE.parent / "board_protocol.json"
+INGEST_SCRIPT = HERE.parent / "知识采集" / "knowledge_ingest.py"
+RECORD_SCRIPT = HERE.parent / "发布归档" / "record_published.py"
+DRAFT_WORKER_SCRIPT = HERE.parent / "AI执行" / "draft_worker.py"
+RADAR_SCRIPT = HERE.parent / "爆款雷达" / "radar.py"
+STATE_HOME = Path(
+    os.environ.get("RAYS_BRAIN_STATE", str(Path.home() / ".local/state/rays-brain"))
+)
+TOPIC_MAP_CANDIDATE_STATE = STATE_HOME / "topic-map-candidates.json"
+TOPIC_MAP_CANDIDATE_NOTE_REL = LAYOUT["topic_map_candidates_file"]
+MAP_DIGEST_NOTE_REL = LAYOUT["map_digest_file"]
+CURRENT_FOCUS_REL = LAYOUT["current_focus_file"]
+PRINCIPLES_REL = LAYOUT["principles_file"]
+if str(INGEST_SCRIPT.parent) not in sys.path:
+    sys.path.insert(0, str(INGEST_SCRIPT.parent))
+try:
+    from topic_map_candidates import apply_topic_map_candidate_action
+except ModuleNotFoundError:
+    def apply_topic_map_candidate_action(*_args, **_kwargs):
+        raise ValueError("主题地图判断需要先安装知识采集模块；工作台其他功能仍可使用")
+
+
+REVIEW_DIR = VAULT / LAYOUT["review_dir"]
+INBOX_FILE = VAULT / LAYOUT["inbox_file"]
+LINK_INBOX_FILE = VAULT / LAYOUT["link_inbox_file"]
+# 锚定在 VAULT（而非代码目录）：指向别的 vault 运行时，队列跟着那个 vault 走
+INTENT_QUEUE_FILE = VAULT / "07_资料与项目/知识工作台/AI任务队列.md"  # 本机改：原为 50-系统/40-自动化/AI任务队列.md
+PIPELINE_LOG_FILE_NAME = "pipeline.log"
+
+# 本机加（11-06）：博主收录（名片 → 全部作品转写 → DeepSeek 写账号拆解初稿）
+import account_service  # noqa: E402  同目录模块
+
+account_service.configure(VAULT, VAULT / LAYOUT["video_clips_dir"], VAULT / "01_对标账号")
+
+
+def area_prefix(key: str) -> str:
+    return LAYOUT[key] + "/"
+
+
+STATUS_PENDING = "待审核"
+
+
+def load_review_protocol() -> tuple[
+    dict[str, str],
+    dict[str, str],
+    dict[str, str],
+    list[dict[str, object]],
+]:
+    """审核动作协议。文件缺失时降级为审核功能整体关闭，其余功能照常；
+    文件存在但内容不合法仍然响亮退出，避免带着坏协议改写审核卡。"""
+    if not REVIEW_PROTOCOL_FILE.exists():
+        return {}, {}, {}, []
+    try:
+        data = json.loads(REVIEW_PROTOCOL_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"审核协议无法解析：{REVIEW_PROTOCOL_FILE}（{exc}）")
+    actions = data.get("actions", [])
+    if not isinstance(actions, list) or not actions:
+        raise SystemExit("审核协议必须包含非空 actions")
+    labels: dict[str, str] = {}
+    aliases: dict[str, str] = {}
+    ui_actions: list[dict[str, object]] = []
+    shortcuts: set[int] = set()
+    for item in actions:
+        key = str(item.get("key", "")).strip()
+        label = str(item.get("label", "")).strip()
+        ui_label = str(item.get("ui_label", "")).strip()
+        try:
+            shortcut = int(item.get("shortcut", 0))
+        except (TypeError, ValueError):
+            shortcut = 0
+        if (
+            not key
+            or not label
+            or not ui_label
+            or shortcut < 1
+            or shortcut > 9
+            or shortcut in shortcuts
+            or key in labels
+            or label in aliases
+        ):
+            raise SystemExit("审核协议包含空值或重复的 key/label")
+        labels[key] = label
+        aliases[label] = key
+        shortcuts.add(shortcut)
+        ui_actions.append(
+            {
+                "key": key,
+                "label": label,
+                "ui_label": ui_label,
+                "shortcut": shortcut,
+            }
+        )
+        for alias in item.get("aliases", []):
+            alias = str(alias).strip()
+            if not alias or alias in aliases:
+                raise SystemExit(f"审核协议包含空值或重复别名：{alias!r}")
+            aliases[alias] = key
+    key_aliases = {
+        str(key).strip(): str(value).strip()
+        for key, value in data.get("key_aliases", {}).items()
+    }
+    if any(target not in labels for target in key_aliases.values()):
+        raise SystemExit("审核协议 key_aliases 指向不存在的动作")
+    ui_actions.sort(key=lambda item: int(item["shortcut"]))
+    return labels, aliases, key_aliases, ui_actions
+
+
+ACTION_LABELS, ACTION_ALIASES, ACTION_KEY_ALIASES, UI_ACTIONS = load_review_protocol()
+
+
+def load_topic_attention_days() -> int:
+    if not REVIEW_PROTOCOL_FILE.exists():
+        return 7
+    try:
+        data = json.loads(REVIEW_PROTOCOL_FILE.read_text(encoding="utf-8"))
+        days = int(data.get("topic_attention", {}).get("candidate_days", 7))
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError) as exc:
+        raise SystemExit(f"无法读取候选注意力期限：{REVIEW_PROTOCOL_FILE}（{exc}）")
+    if not 1 <= days <= 30:
+        raise SystemExit("候选注意力期限必须在 1–30 天之间")
+    return days
+
+
+TOPIC_ATTENTION_DAYS = load_topic_attention_days()
+
+
+def load_review_daily_limit() -> int:
+    if not REVIEW_PROTOCOL_FILE.exists():
+        return 3
+    try:
+        data = json.loads(REVIEW_PROTOCOL_FILE.read_text(encoding="utf-8"))
+        limit = int(data.get("review_attention", {}).get("daily_limit", 3))
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError) as exc:
+        raise SystemExit(f"无法读取每日审核上限：{REVIEW_PROTOCOL_FILE}（{exc}）")
+    if not 1 <= limit <= 10:
+        raise SystemExit("每日审核上限必须在 1–10 条之间")
+    return limit
+
+
+REVIEW_DAILY_LIMIT = load_review_daily_limit()
+# 协议缺失（降级模式）时用一个永不匹配的分支占位，勾选解析自然全部落空
+_ACTION_LABEL_PATTERN = "|".join(
+    sorted((re.escape(label) for label in ACTION_ALIASES), key=len, reverse=True)
+) or r"(?!x)x"
+ACTION_PATTERN = re.compile(
+    rf"^- \[(?P<checked>[ xX])\]\s+(?P<label>{_ACTION_LABEL_PATTERN})\s*$",
+    flags=re.M,
+)
+
+
+def load_board_protocol() -> tuple[list[dict[str, object]], dict[str, dict[str, object]]]:
+    """看板状态流转协议：哪些 kind、在哪些目录、允许哪些状态变化。
+
+    sequence 会展开为相邻状态的「推进/退回」；from 为 "*" 表示任一已声明状态。
+    这里只做声明校验，真正执行前 apply_transition 还会重新核对文件现状。
+    """
+    if not BOARD_PROTOCOL_FILE.exists():
+        return [], {}
+    try:
+        data = json.loads(BOARD_PROTOCOL_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"看板协议无法解析：{BOARD_PROTOCOL_FILE}（{exc}）")
+    groups: list[dict[str, object]] = []
+    kind_map: dict[str, dict[str, object]] = {}
+    for raw in data.get("groups", []):
+        kinds = [str(kind).strip() for kind in raw.get("kinds", []) if str(kind).strip()]
+        labels = {
+            str(key).strip(): str(value).strip()
+            for key, value in raw.get("status_labels", {}).items()
+        }
+        dir_keys = [str(key).strip() for key in raw.get("dirs", [])]
+        if not kinds or not labels or not dir_keys:
+            raise SystemExit("看板协议的每一组都必须包含 kinds、status_labels 和 dirs")
+        unknown_dirs = [key for key in dir_keys if key not in LAYOUT]
+        if unknown_dirs:
+            raise SystemExit(f"看板协议 dirs 引用了未知布局键：{'、'.join(unknown_dirs)}")
+        transitions: list[dict[str, object]] = []
+
+        def add_transition(source: str, target: str, label: str, confirm: str = "", extra: dict | None = None) -> None:
+            if source == target or source not in labels or target not in labels:
+                raise SystemExit(f"看板协议包含无效流转：{source!r} → {target!r}")
+            if any(t["from"] == source and t["to"] == target for t in transitions):
+                return
+            transitions.append(
+                {
+                    "from": source,
+                    "to": target,
+                    "label": label,
+                    "confirm": confirm,
+                    "set": {str(k): str(v) for k, v in (extra or {}).items()},
+                }
+            )
+
+        sequence = [str(item).strip() for item in raw.get("sequence", [])]
+        for item in raw.get("transitions", []):
+            source = str(item.get("from", "")).strip()
+            target = str(item.get("to", "")).strip()
+            label = str(item.get("label", "")).strip()
+            confirm = str(item.get("confirm", "")).strip()
+            extra = item.get("set", {})
+            if not label:
+                raise SystemExit("看板协议的每条流转都必须有 label")
+            sources = [s for s in labels if s != target] if source == "*" else [source]
+            for one in sources:
+                add_transition(one, target, label, confirm, extra)
+        for left, right in zip(sequence, sequence[1:]):
+            add_transition(left, right, f"推进到「{labels.get(right, right)}」")
+            add_transition(right, left, f"退回「{labels.get(left, left)}」")
+        group = {
+            "kinds": kinds,
+            "prefixes": tuple(LAYOUT[key] + "/" for key in dir_keys),
+            "status_labels": labels,
+            "set_on_change": {
+                str(k): str(v) for k, v in raw.get("set_on_change", {}).items()
+            },
+            "transitions": transitions,
+        }
+        groups.append(group)
+        for kind in kinds:
+            if kind in kind_map:
+                raise SystemExit(f"看板协议中 kind 重复声明：{kind}")
+            kind_map[kind] = group
+    return groups, kind_map
+
+
+BOARD_GROUPS, BOARD_KIND_MAP = load_board_protocol()
+
+
+def client_board_protocol() -> dict[str, object]:
+    """给前端的流转描述：按 kind 展平，不含目录约束等服务端细节。"""
+    result: dict[str, object] = {}
+    for kind, group in BOARD_KIND_MAP.items():
+        result[kind] = {
+            "status_labels": group["status_labels"],
+            "transitions": [
+                {
+                    "from": t["from"],
+                    "to": t["to"],
+                    "label": t["label"],
+                    "confirm": t["confirm"],
+                }
+                for t in group["transitions"]
+            ],
+        }
+    return result
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def try_read(path: Path) -> str | None:
+    """扫描途中文件可能被采集流程移走，或还没从 iCloud 下载；坏一个不拖垮整页。"""
+    try:
+        return read_text(path)
+    except OSError:
+        return None
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode if path.exists() else None
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as handle:
+        handle.write(content)
+        temporary = Path(handle.name)
+    if mode is not None:
+        temporary.chmod(mode)
+    temporary.replace(path)
+
+
+def yaml_value(value: str) -> str:
+    """尽量写无引号的简单值：vault 里既有的 Obsidian 查询按 `^status: active$` 匹配。"""
+    value = str(value)
+    if not value or value != value.strip() or re.search(r'[:#"\'\n\[\]{}]', value):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def update_frontmatter_text(text: str, updates: dict[str, str]) -> str:
+    """定点改写页首属性：只动指定键，其余行原样保留；缺失键补在块尾。"""
+    if not text.startswith("---\n"):
+        raise ValueError("这篇笔记缺少页首属性，无法在工作台改状态")
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        raise ValueError("这篇笔记页首属性不完整，请先在 Obsidian 中检查")
+    lines = text[4:end].splitlines()
+    positions: dict[str, int] = {}
+    for index, line in enumerate(lines):
+        if ":" not in line or line.startswith((" ", "\t", "-")):
+            continue
+        positions[line.split(":", 1)[0].strip()] = index
+    for key, value in updates.items():
+        rendered = f"{key}: {yaml_value(value)}"
+        if key in positions:
+            lines[positions[key]] = rendered
+        else:
+            lines.append(rendered)
+    return "---\n" + "\n".join(lines) + text[end:]
+
+
+def resolve_set_value(value: str) -> str:
+    now = datetime.now().astimezone()
+    if value == "$date":
+        return now.date().isoformat()
+    if value == "$datetime":
+        return now.strftime("%Y-%m-%d %H:%M")
+    return value
+
+
+_LOG_LOCK = threading.Lock()
+
+
+def log_operation(entry: dict[str, object]) -> None:
+    """操作日志只是审计线索，写失败不能影响请求本身。"""
+    record = {"at": datetime.now().astimezone().isoformat(timespec="seconds"), **entry}
+    try:
+        log_dir = STATE_HOME / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with _LOG_LOCK, (log_dir / "dashboard-actions.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def parse_frontmatter(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if not text.startswith("---\n"):
+        return result
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return result
+    for line in text[4:end].splitlines():
+        if ":" not in line or line.startswith((" ", "\t", "-")):
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip()
+        if value.startswith('"'):
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        result[key.strip()] = str(value)
+    return result
+
+
+def without_frontmatter(text: str) -> str:
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---\n", 4)
+    return text[end + 5 :] if end >= 0 else text
+
+
+def title_of(path: Path, text: str) -> str:
+    match = re.search(r"^#\s+(.+?)\s*$", text, flags=re.M)
+    return match.group(1).strip() if match else path.stem
+
+
+def section_of(text: str, heading: str) -> str:
+    match = re.search(
+        rf"^##\s+{re.escape(heading)}\s*$\n(?P<body>.*?)(?=^##\s|\Z)",
+        text,
+        flags=re.M | re.S,
+    )
+    return match.group("body").strip() if match else ""
+
+
+def plain_excerpt(value: str, limit: int = 220) -> str:
+    value = re.sub(r"^---.*?^---\s*", "", value, flags=re.M | re.S)
+    value = re.sub(r"!?(\[\[)([^\]|]+)(?:\|([^\]]+))?\]\]", lambda m: m.group(3) or m.group(2), value)
+    value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
+    value = re.sub(r"https?://\S+", "", value)
+    value = re.sub(r"^[#>*`\-]+\s*", "", value, flags=re.M)
+    value = re.sub(r"[*_`~]", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+
+
+def first_value(meta: dict[str, str], *keys: str) -> str:
+    for key in keys:
+        value = meta.get(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def score_value(value: object) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def content_values(meta: dict[str, str]) -> dict[str, object]:
+    """兼容管线新旧字段名，向页面提供稳定的三项判断值。"""
+    return {
+        "knowledge_value": first_value(
+            meta, "knowledge_value_score", "knowledge_value", "long_term_value_score"
+        ),
+        "writing_value": first_value(
+            meta, "writing_value_score", "writing_value", "content_value_score"
+        ),
+        "timeliness": first_value(
+            meta, "timeliness", "freshness", "freshness_status", "time_sensitivity"
+        ),
+    }
+
+
+def relative(path: Path) -> str:
+    return path.relative_to(VAULT).as_posix()
+
+
+def obsidian_uri(path: Path) -> str:
+    return "obsidian://open?path=" + quote(str(path.resolve()), safe="")
+
+
+def selected_action(text: str) -> str | None:
+    selected = [
+        ACTION_ALIASES.get(match.group("label"))
+        for match in ACTION_PATTERN.finditer(text)
+        if match.group("checked").lower() == "x"
+    ]
+    selected = [item for item in selected if item]
+    return selected[0] if len(selected) == 1 else None
+
+
+def review_card(path: Path) -> dict[str, object]:
+    text = read_text(path)
+    meta = parse_frontmatter(text)
+    score = score_value(meta.get("priority_score") or meta.get("relevance_score", "0"))
+    summary = section_of(text, "摘要") or section_of(text, "快速判断")
+    reviewed_at = meta.get("reviewed_at", "")
+    card = {
+        "path": relative(path),
+        "title": title_of(path, text),
+        "summary": plain_excerpt(summary or text),
+        "score": score,
+        "recommendation": meta.get("recommendation", "待判断"),
+        "confidence": meta.get("confidence", ""),
+        "kind": meta.get("suggested_kind", ""),
+        "knowledge_unit_count": score_value(meta.get("knowledge_unit_count", "0")),
+        "entity_count": score_value(meta.get("entity_count", "0")),
+        "status": meta.get("status", "未标记"),
+        "source_url": meta.get("source_url", ""),
+        "source_note": resolve_note_ref(meta.get("source_file", "")),
+        "reviewed_at": reviewed_at,
+        "knowledge_auto_at": meta.get("knowledge_auto_at", ""),
+        "knowledge_auto_policy": meta.get("knowledge_auto_policy", ""),
+        "personal_context_status": meta.get("personal_context_status", ""),
+        "selected_action": selected_action(text),
+        "obsidian_uri": obsidian_uri(path),
+    }
+    card.update(content_values(meta))
+    return card
+
+
+def load_reviews() -> list[dict[str, object]]:
+    if not REVIEW_DIR.exists():
+        return []
+    cards = []
+    for path in REVIEW_DIR.glob("*.md"):
+        try:
+            cards.append(review_card(path))
+        except OSError:
+            continue
+    cards.sort(key=lambda item: (int(item["score"]), str(item["reviewed_at"])), reverse=True)
+    return cards
+
+
+def markdown_files() -> list[Path]:
+    ignored_parts = {".git", ".obsidian", "node_modules", "__pycache__"}
+    try:
+        dashboard_rel = HERE.relative_to(VAULT).parts
+    except ValueError:
+        dashboard_rel = ()
+    files: list[Path] = []
+    for path in VAULT.rglob("*.md"):
+        rel_parts = path.relative_to(VAULT).parts
+        if any(part in ignored_parts for part in rel_parts):
+            continue
+        if dashboard_rel and rel_parts[: len(dashboard_rel)] == dashboard_rel:
+            continue
+        files.append(path)
+    return files
+
+
+# 健康快照里由实时采集状态覆盖的原因，见 knowledge_health.py 的同名文案。
+LIVE_SUPERSEDED_REASON = re.compile(r"个未解决错误|轮读取失败")
+
+
+def load_snapshots(limit: int = 10) -> list[dict[str, object]]:
+    snapshot_dir = STATE_HOME / "health-snapshots"
+    points: list[dict[str, object]] = []
+    if snapshot_dir.exists():
+        for path in sorted(snapshot_dir.glob("*.json"))[-limit:]:
+            try:
+                item = json.loads(read_text(path))
+            except (json.JSONDecodeError, OSError):
+                continue
+            points.append(
+                {
+                    "date": item.get("date", path.stem),
+                    "health": item.get("health", "unknown"),
+                    "pending": item.get("human_pending", 0),
+                    "writable": item.get("writable_cards", 0),
+                    "captured": item.get("captured_today_total", 0),
+                    "knowledge_added": len(item.get("knowledge_added", [])),
+                    "generated_at": item.get("generated_at", ""),
+                    "red_reasons": item.get("red_reasons", []),
+                    "yellow_reasons": item.get("yellow_reasons", []),
+                }
+            )
+    return points
+
+
+def load_runtime_state() -> dict[str, object]:
+    state_file = STATE_HOME / "state.json"
+    if not state_file.exists():
+        return {}
+    try:
+        return json.loads(read_text(state_file))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def load_json_file(path: Path, default: object) -> object:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(read_text(path))
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def recent_notes(files: list[Path], limit: int = 9) -> list[dict[str, object]]:
+    candidates: list[tuple[float, Path]] = []
+    for path in files:
+        if relative(path).startswith(area_prefix("archive_dir")):
+            continue
+        try:
+            candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    result: list[dict[str, object]] = []
+    for mtime, path in candidates:
+        if len(result) >= limit:
+            break
+        text = try_read(path)
+        if text is None:
+            continue
+        meta = parse_frontmatter(text)
+        top = relative(path).split("/", 1)[0]
+        result.append(
+            {
+                "path": relative(path),
+                "title": title_of(path, text),
+                "kind": meta.get("kind", ""),
+                "area": top,
+                "modified": datetime.fromtimestamp(mtime).astimezone().isoformat(timespec="minutes"),
+                "obsidian_uri": obsidian_uri(path),
+            }
+        )
+    return result
+
+
+def note_record(path: Path, text: str, mtime: float) -> dict[str, object]:
+    meta = parse_frontmatter(text)
+    summary = (
+        section_of(text, "一句话判断")
+        or section_of(text, "核心判断")
+        or section_of(text, "摘要")
+    )
+    item: dict[str, object] = {
+        "path": relative(path),
+        "title": title_of(path, text),
+        "summary": plain_excerpt(summary),
+        "kind": meta.get("kind", ""),
+        "status": meta.get("status", ""),
+        "priority_score": score_value(meta.get("priority_score", "0")),
+        "writing_value_score": score_value(
+            meta.get("writing_value_score") or meta.get("writing_value", "0")
+        ),
+        "platform": meta.get("platform", ""),
+        "modified": datetime.fromtimestamp(mtime).astimezone().isoformat(timespec="minutes"),
+        "obsidian_uri": obsidian_uri(path),
+    }
+    item.update(content_values(meta))
+    return item
+
+
+def notes_under(
+    files: list[Path],
+    prefix: str,
+    limit: int,
+    *,
+    exclude_prefixes: tuple[str, ...] = (),
+    predicate=None,
+    sort_key=None,
+) -> list[dict[str, object]]:
+    rows: list[tuple[float, Path]] = []
+    for path in files:
+        rel = relative(path)
+        if not rel.startswith(prefix) or any(rel.startswith(item) for item in exclude_prefixes):
+            continue
+        try:
+            rows.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    rows.sort(key=lambda row: row[0], reverse=True)
+    result: list[dict[str, object]] = []
+    for mtime, path in rows:
+        text = try_read(path)
+        if text is None:
+            continue
+        item = note_record(path, text, mtime)
+        if predicate is not None and not predicate(item, parse_frontmatter(text)):
+            continue
+        result.append(item)
+    if sort_key is not None:
+        result.sort(key=sort_key, reverse=True)
+    return result[:limit]
+
+
+def has_topic_freshness_anchor(meta: dict[str, str]) -> bool:
+    return bool(
+        meta.get("source_published_at", "").strip()
+        or (
+            meta.get("refreshed_at", "").strip()
+            and meta.get("refresh_source", "").strip()
+        )
+    )
+
+
+def topic_attention_active(meta: dict[str, str], today: date | None = None) -> bool:
+    raw_until = meta.get("attention_until", "").strip().strip('"')
+    try:
+        attention_until = date.fromisoformat(raw_until) if raw_until else None
+    except ValueError:
+        attention_until = None
+    if attention_until is None:
+        raw_entered = (
+            meta.get("attention_entered_at", "").strip()
+            or meta.get("created_at", "").strip()
+            or meta.get("last_progress_at", "").strip()
+        )
+        match = re.search(r"\d{4}-\d{2}-\d{2}", raw_entered)
+        if not match:
+            return False
+        attention_until = date.fromisoformat(match.group(0)) + timedelta(
+            days=TOPIC_ATTENTION_DAYS
+        )
+    return bool(
+        meta.get("attention_status", "fresh").strip().lower() != "expired"
+        and (today or date.today()) < attention_until
+    )
+
+
+def load_topic_candidates(files: list[Path], limit: int = 40) -> list[dict[str, object]]:
+    today = date.today()
+    return notes_under(
+        files,
+        area_prefix("topics_dir"),
+        limit,
+        predicate=lambda item, meta: (
+            meta.get("kind") == "topic-candidate"
+            and meta.get("status") == "candidate"
+            and topic_attention_active(meta, today)
+        ),
+        sort_key=lambda item: (
+            int(item["priority_score"]),
+            int(item["writing_value_score"]),
+            str(item["modified"]),
+        ),
+    )
+
+
+def load_topic_continuations(files: list[Path], limit: int = 40) -> list[dict[str, object]]:
+    today = date.today().isoformat()
+    return notes_under(
+        files,
+        area_prefix("topics_dir"),
+        limit,
+        predicate=lambda item, meta: (
+            meta.get("kind") == "topic-candidate"
+            and meta.get("status") == "partially-published"
+            and has_topic_freshness_anchor(meta)
+            and meta.get("freshness_status") == "fresh"
+            and meta.get("fresh_until", "") >= today
+        ),
+        sort_key=lambda item: (
+            int(item["priority_score"]),
+            int(item["writing_value_score"]),
+            str(item["modified"]),
+        ),
+    )
+
+
+REFERENCE_TOPIC_STATUSES = {"closed", "parked"}
+
+
+def load_topic_reference(files: list[Path], limit: int = 200) -> list[dict[str, object]]:
+    """选题参考：已关闭或暂缓的候选与选题储备。想不到角度时翻看，不是待办。"""
+    rows: list[dict[str, object]] = []
+    for prefix in (area_prefix("topics_dir"), area_prefix("topic_reserve_dir")):
+        rows.extend(
+            notes_under(
+                files,
+                prefix,
+                limit,
+                predicate=lambda item, meta: (
+                    meta.get("kind") == "topic-candidate"
+                    and meta.get("status", "").strip().strip('"') in REFERENCE_TOPIC_STATUSES
+                ),
+            )
+        )
+    rows.sort(
+        key=lambda item: (int(item["writing_value_score"]), int(item["priority_score"])),
+        reverse=True,
+    )
+    return rows[:limit]
+
+
+INACTIVE_TASK_STATUSES = {
+    "published",
+    "completed",
+    "archived",
+    "cancelled",
+    "closed",
+    "done",
+    "已发布",
+    "已完成",
+    "已归档",
+    "已取消",
+}
+
+
+def load_writing_tasks(files: list[Path], limit: int = 40) -> list[dict[str, object]]:
+    return notes_under(
+        files,
+        area_prefix("writing_tasks_dir"),
+        limit,
+        predicate=lambda item, meta: (
+            meta.get("kind") in {"writing-task", "content-task", "content-pack"}
+            and meta.get("status", "").strip().lower() not in INACTIVE_TASK_STATUSES
+        ),
+        sort_key=lambda item: (
+            int(item["priority_score"]),
+            int(item["writing_value_score"]),
+            str(item["modified"]),
+        ),
+    )
+
+
+INACTIVE_DRAFT_STATUSES = INACTIVE_TASK_STATUSES | {
+    "alternative-draft",
+    "superseded",
+}
+
+
+def load_drafts(files: list[Path], limit: int = 40) -> list[dict[str, object]]:
+    """母稿看板：两处草稿，按目录分，不是按 kind 分。
+
+    从长文改出来的口播稿放在 drafts_dir，跟着母稿走，不在这里单独占位——这是原
+    来就有的规矩。但以口播起稿、根本没有图文母稿的内容（FDE 系列这种）放在
+    oral_scripts_dir，它自己就是母稿；不收进来，这类内容在看板上一次都不会出现。
+    """
+    def active(kinds: set[str] | frozenset[str]):
+        return lambda item, meta: (
+            meta.get("kind") in kinds
+            and meta.get("status", "").strip().lower() not in INACTIVE_DRAFT_STATUSES
+        )
+
+    merged = notes_under(
+        files, area_prefix("drafts_dir"), limit, predicate=active({"draft", "article-draft"})
+    ) + notes_under(
+        files, area_prefix("oral_scripts_dir"), limit, predicate=active(ORAL_SCRIPT_KINDS)
+    )
+    merged.sort(key=lambda item: str(item.get("modified", "")), reverse=True)
+    return merged[:limit]
+
+
+COMPLETED_FEEDBACK_STATUSES = {
+    "complete",
+    "not-needed",
+    # 只保留旧卡兼容；新写入统一使用 complete / not-needed。
+    "reviewed", "completed", "closed", "done", "已复盘", "已完成", "已关闭",
+}
+
+
+def is_past_due(raw: str) -> bool:
+    """复盘截止时间已过；只有日期的按当天结束算，口径同 knowledge_health。"""
+    raw = raw.strip().strip('"')
+    if not raw:
+        return False
+    now = datetime.now().astimezone()
+    try:
+        if len(raw) == 10:
+            return date.fromisoformat(raw) < now.date()
+        due = datetime.fromisoformat(raw.replace(" ", "T", 1))
+    except ValueError:
+        return False
+    if due.tzinfo is None:
+        due = due.astimezone()
+    return due < now
+
+
+def load_feedback(files: list[Path], limit: int = 80) -> list[dict[str, object]]:
+    completion_fields = (
+        "reviewed_at",
+        "completed_at",
+        "feedback_completed_at",
+    )
+
+    def is_feedback(item: dict[str, object], meta: dict[str, str]) -> bool:
+        return meta.get("kind") in {
+            "content-feedback",
+            "publication-feedback",
+            "feedback",
+        }
+
+    rows = notes_under(
+        files,
+        area_prefix("feedback_dir"),
+        limit,
+        predicate=is_feedback,
+    )
+    for item in rows:
+        path = VAULT / str(item["path"])
+        text = try_read(path) or ""
+        meta = parse_frontmatter(text)
+        status = meta.get("status", "").strip().lower()
+        completed = status in COMPLETED_FEEDBACK_STATUSES or any(
+            meta.get(key, "").strip() for key in completion_fields
+        )
+        item["pending"] = not completed
+        item["due_at"] = first_value(
+            meta,
+            "due_at",
+            "due_date",
+            "feedback_due_at",
+            "review_due_at",
+            "feedback_due",
+        )
+        item["overdue"] = bool(item["pending"]) and (
+            status in {"overdue", "已逾期", "逾期"} or is_past_due(str(item["due_at"]))
+        )
+    rows.sort(
+        key=lambda item: (
+            bool(item.get("pending")),
+            str(item.get("due_at", "")),
+            str(item["modified"]),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+# ---------- 当前关注：让排序知道 Ray 这几周押注什么，而不只看分数和截止日期 ----------
+
+FOCUS_ITEM = re.compile(r"^##\s+\d+\.\s*(.*?)\s*$")
+FOCUS_PLACEHOLDER = re.compile(r"^[（(].*[)）]$")
+
+
+def load_current_focus() -> dict[str, object]:
+    path = VAULT / CURRENT_FOCUS_REL
+    text = try_read(path) if path.is_file() else None
+    if text is None:
+        return {"path": "", "items": [], "stale": False, "updated_at": "", "review_after": ""}
+    meta = parse_frontmatter(text)
+    items: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    for line in without_frontmatter(text).splitlines():
+        heading = FOCUS_ITEM.match(line)
+        if heading:
+            title = heading.group(1).strip()
+            current = {"title": title, "keywords": []} if title and not FOCUS_PLACEHOLDER.match(title) else None
+            if current:
+                items.append(current)
+            continue
+        if line.startswith("## "):
+            current = None
+            continue
+        keywords = re.match(r"^\s*-\s*关键词：(.*)$", line)
+        if current is not None and keywords:
+            current["keywords"] = [
+                word.strip() for word in re.split(r"[，,、/；;]", keywords.group(1)) if len(word.strip()) >= 2
+            ]
+    review_after = meta.get("review_after", "")
+    return {
+        "path": CURRENT_FOCUS_REL,
+        "items": items[:3],
+        "updated_at": meta.get("updated_at", ""),
+        "review_after": review_after,
+        "stale": bool(items) and bool(review_after) and review_after < date.today().isoformat(),
+    }
+
+
+def focus_hits(item: dict[str, object], focus: dict[str, object]) -> list[str]:
+    """命中哪几条当前关注：关键词出现在标题或摘要里即算。"""
+    haystack = f"{item.get('title', '')} {item.get('summary', '')}".casefold()
+    return [
+        str(entry["title"])
+        for entry in focus.get("items", [])  # type: ignore[union-attr]
+        if any(str(word).casefold() in haystack for word in entry.get("keywords", []))  # type: ignore[union-attr]
+    ]
+
+
+def apply_focus(rows: list[dict[str, object]], focus: dict[str, object]) -> list[dict[str, object]]:
+    """标出命中项并稳定上移：同为命中或同为未命中时保留原有排序。"""
+    for row in rows:
+        row["focus_hits"] = focus_hits(row, focus)
+    return sorted(rows, key=lambda row: not row["focus_hits"])
+
+
+def dashboard_payload() -> dict[str, object]:
+    files = markdown_files()
+    reviews = load_reviews()
+    pending = [card for card in reviews if card["status"] == STATUS_PENDING]
+    decision_pending = [card for card in pending if not card["selected_action"]]
+    queued = [card for card in pending if card["selected_action"]]
+    topic_candidates = load_topic_candidates(files, len(files))
+    topic_continuations = load_topic_continuations(files, len(files))
+    topic_reference = load_topic_reference(files, len(files))
+    writing_tasks = load_writing_tasks(files, len(files))
+    feedback = load_feedback(files, len(files))
+    feedback_pending = [item for item in feedback if item["pending"]]
+    drafts = load_drafts(files, len(files))
+    current_focus = load_current_focus()
+    decision_pending = apply_focus(decision_pending, current_focus)
+    topic_candidates = apply_focus(topic_candidates, current_focus)
+    topic_continuations = apply_focus(topic_continuations, current_focus)
+    drafts = apply_focus(drafts, current_focus)
+    published = notes_under(
+        files,
+        area_prefix("published_dir"),
+        30,
+        exclude_prefixes=(area_prefix("feedback_dir"),),
+    )
+    for row in published:
+        if row["platform"]:
+            continue
+        parts = str(row["path"]).split("/")
+        row["platform"] = re.sub(r"^\d+-", "", parts[1]) if len(parts) > 2 else ""
+
+    knowledge_files = [path for path in files if relative(path).startswith(area_prefix("knowledge_dir"))]
+    knowledge_kinds: Counter[str] = Counter()
+    for path in knowledge_files:
+        text = try_read(path)
+        if text is None:
+            continue
+        kind = parse_frontmatter(text).get("kind", "未标记") or "未标记"
+        knowledge_kinds[kind] += 1
+
+    trend = load_snapshots()
+    latest_snapshot = trend[-1] if trend else {}
+    runtime = load_runtime_state()
+    topic_map_state = load_json_file(TOPIC_MAP_CANDIDATE_STATE, {})
+    topic_map_candidates = (
+        topic_map_state.get("candidates", [])
+        if isinstance(topic_map_state, dict)
+        else []
+    )
+    topic_map_observing = (
+        topic_map_state.get("observing", [])
+        if isinstance(topic_map_state, dict)
+        else []
+    )
+    unresolved_errors = [item for item in runtime.get("errors", []) if not item.get("resolved_at")]
+    source_health = runtime.get("source_health", {})
+    degraded_sources = [
+        {
+            "source": str(key),
+            "label": str(value.get("label", key)),
+            "consecutive_failures": int(value.get("consecutive_failures", 0) or 0),
+            "last_failure_at": str(value.get("last_failure_at", "")),
+            "message": str(value.get("message", "")),
+        }
+        for key, value in source_health.items()
+        if isinstance(value, dict) and value.get("status") == "degraded"
+    ]
+    pipeline_pending = len(runtime.get("pending_sources", []))
+    try:
+        # state.json 每轮采集都会保存，它的 mtime 就是管线最近一次活动时间
+        pipeline_last_activity = (
+            datetime.fromtimestamp((STATE_HOME / "state.json").stat().st_mtime)
+            .astimezone()
+            .isoformat(timespec="minutes")
+        )
+    except OSError:
+        pipeline_last_activity = ""
+    reports = [
+        entry
+        for entry in (
+            {"title": "健康日报", "path": LAYOUT["health_daily_dir"] + "/最新健康日报.md"},
+            {"title": "知识库周报", "path": LAYOUT["health_weekly_dir"] + "/最新知识库周报.md"},
+            {"title": "主题地图候选", "path": TOPIC_MAP_CANDIDATE_NOTE_REL},
+            {"title": "当前关注", "path": CURRENT_FOCUS_REL},
+            {"title": "原则", "path": PRINCIPLES_REL},
+            {"title": "知识地图整理", "path": MAP_DIGEST_NOTE_REL},
+        )
+        if (VAULT / entry["path"]).is_file()
+    ]
+    # 采集错误和来源失败以实时状态为准：快照里的同类原因可能早已解决，
+    # 只留快照独有的原因，再按剩下的红/黄原因重算健康度。
+    snapshot_red = [
+        str(reason)
+        for reason in latest_snapshot.get("red_reasons", [])
+        if not LIVE_SUPERSEDED_REASON.search(str(reason))
+    ]
+    snapshot_yellow = [
+        str(reason)
+        for reason in latest_snapshot.get("yellow_reasons", [])
+        if not LIVE_SUPERSEDED_REASON.search(str(reason))
+    ]
+    health = str(latest_snapshot.get("health", "unknown"))
+    if health in {"red", "yellow", "green"}:
+        health = "red" if snapshot_red else "yellow" if snapshot_yellow else "green"
+    health_reasons = snapshot_red + snapshot_yellow
+    if unresolved_errors:
+        health = "red"
+        health_reasons.append(f"有 {len(unresolved_errors)} 个采集错误待处理")
+    elif degraded_sources:
+        if any(item["consecutive_failures"] >= 3 for item in degraded_sources):
+            health = "red"
+        elif health == "green":
+            health = "yellow"
+        health_reasons.extend(
+            f"{item['label']}已连续 {item['consecutive_failures']} 轮读取失败"
+            for item in degraded_sources
+        )
+    elif len(decision_pending) >= 10:
+        health = "yellow"
+        health_reasons.append(f"有 {len(decision_pending)} 张卡片等你判断")
+    elif health == "unknown":
+        health = "green"
+    if not ACTION_LABELS and pending:
+        # 降级模式：没有审核协议时卡片只读，提醒去 Obsidian 处理或补协议
+        if health == "green":
+            health = "yellow"
+        health_reasons.append(
+            f"审核协议未安装（review_protocol.json），{len(pending)} 张审核卡暂时只读"
+        )
+
+    high_value = [card for card in decision_pending if int(card["score"]) >= 90]
+    low_value = [
+        card for card in decision_pending
+        if int(card["score"]) < 65 or card["recommendation"] == "清理"
+    ]
+    # 今天最值得做的一件事：先收尾已到期的复盘，再推进手上的稿子，最后才是新资料。
+    feedback_overdue = [item for item in feedback_pending if item.get("overdue")]
+    review_today = min(len(decision_pending), REVIEW_DAILY_LIMIT)
+    focus_options = (
+        (feedback_overdue, f"先复盘 {len(feedback_overdue)} 篇已到期的发布内容",
+         "已到期待复盘", "复盘结论会写回长期知识，越晚补越难回忆。", "feedback"),
+        (drafts, f"推进 {len(drafts)} 篇手上的稿子",
+         "在推进的稿子", "先处理「待确认」，能录的录、能发的发。", "drafts"),
+        (decision_pending, f"今天先判断 {review_today} 条资料",
+         "等待判断", "这里的选择会进入原有自动处理流程。", "review"),
+        (writing_tasks, f"从 {len(writing_tasks)} 个写作任务里推进一篇",
+         "写作任务", "", "tasks"),
+        (topic_continuations, f"从 {len(topic_continuations)} 个可续写角度里挑一个推进",
+         "可续写角度", "", "continuations"),
+        (feedback_pending, f"复盘 {len(feedback_pending)} 篇已发布内容",
+         "待复盘", "", "feedback"),
+        # 候选是可选参考池，不是待办；只有别的都清空时才提示翻一翻。
+        (topic_candidates, f"想不到写什么时，翻翻 {len(topic_candidates)} 个候选选题",
+         "候选选题", "候选只作参考，想法清楚就直接立项写作任务。", "topics"),
+    )
+    focus, focus_label, focus_hint, focus_target, focus_count = (
+        "当前没有紧急积压，适合整理旧知识", "当前积压", "", "", 0
+    )
+    for items, text, label, hint, target in focus_options:
+        if items:
+            focus, focus_label, focus_hint, focus_target = text, label, hint, target
+            focus_count = len(items)
+            break
+
+    def count_prefix(prefix: str, exclude_prefixes: tuple[str, ...] = ()) -> int:
+        return sum(
+            1
+            for path in files
+            if relative(path).startswith(prefix)
+            and not any(relative(path).startswith(item) for item in exclude_prefixes)
+        )
+
+    return {
+        "schema_version": DASHBOARD_SCHEMA_VERSION,
+        "server_started_at": SERVER_STARTED_AT,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "vault": VAULT.name,
+        "health": health,
+        "health_reasons": health_reasons,
+        "review_actions": UI_ACTIONS,
+        "review_daily_limit": REVIEW_DAILY_LIMIT,
+        "board_protocol": client_board_protocol(),
+        "pipeline": {
+            "last_activity": pipeline_last_activity,
+            "unresolved_errors": len(unresolved_errors),
+            "degraded_sources": len(degraded_sources),
+            "pending": pipeline_pending,
+        },
+        "reports": reports,
+        "focus": focus,
+        "current_focus": current_focus,
+        "focus_count": focus_count,
+        "focus_label": focus_label,
+        "focus_hint": focus_hint,
+        "focus_target": focus_target,
+        "counts": {
+            "all_notes": len(files),
+            "captured": count_prefix(area_prefix("sources_dir")),
+            "pipeline_pending": pipeline_pending,
+            "decision_pending": len(decision_pending),
+            "queued": len(queued),
+            "topic_candidates": len(topic_candidates),
+            "topic_continuations": len(topic_continuations),
+            "topic_reference": len(topic_reference),
+            "writing_tasks": len(writing_tasks),
+            "knowledge": len(knowledge_files),
+            "drafts": len(drafts),
+            "published": count_prefix(
+                area_prefix("published_dir"),
+                (area_prefix("feedback_dir"),),
+            ),
+            "feedback": len(feedback),
+            "feedback_pending": len(feedback_pending),
+            "topic_map_candidates": len(topic_map_candidates),
+            "high_value": len(high_value),
+            "low_value": len(low_value),
+        },
+        "reviews": decision_pending,
+        "queued_reviews": queued,
+        "topic_candidates": topic_candidates,
+        "topic_continuations": topic_continuations,
+        "topic_reference": topic_reference,
+        "writing_tasks": writing_tasks,
+        "drafts": drafts,
+        "published": published,
+        "feedback": feedback,
+        "recent": recent_notes(files),
+        "knowledge_kinds": dict(knowledge_kinds.most_common()),
+        "topic_map_candidates": topic_map_candidates,
+        "topic_map_observing": topic_map_observing,
+        "topic_map_summary": (
+            topic_map_state.get("summary", {})
+            if isinstance(topic_map_state, dict)
+            else {}
+        ),
+        "trend": trend,
+        "performance": load_performance(files),
+        "health_issues": health_issue_groups(),
+        "latest_health_at": latest_snapshot.get("generated_at", ""),
+        "inbox_uri": obsidian_uri(INBOX_FILE),
+    }
+
+
+def watch_signature() -> tuple:
+    """高频变化位置的 mtime 指纹。只盯少量目录，避免每 2 秒扫全库。"""
+    parts: list[tuple[str, int]] = []
+
+    def add(root: Path, pattern: str, recursive: bool = False) -> None:
+        if not root.exists():
+            return
+        for item in (root.rglob(pattern) if recursive else root.glob(pattern)):
+            try:
+                parts.append((str(item), item.stat().st_mtime_ns))
+            except OSError:
+                continue
+
+    add(REVIEW_DIR, "*.md")
+    add(VAULT / LAYOUT["topics_dir"], "*.md", recursive=True)
+    add(VAULT / LAYOUT["topic_reserve_dir"], "*.md", recursive=True)
+    add(VAULT / LAYOUT["writing_tasks_dir"], "*.md", recursive=True)
+    add(VAULT / LAYOUT["drafts_dir"], "*.md", recursive=True)
+    add(VAULT / LAYOUT["oral_scripts_dir"], "*.md", recursive=True)
+    add(VAULT / LAYOUT["published_dir"], "*.md", recursive=True)
+    add(STATE_HOME / "health-snapshots", "*.json")
+    for single in (INBOX_FILE, STATE_HOME / "state.json", TOPIC_MAP_CANDIDATE_STATE):
+        try:
+            parts.append((str(single), single.stat().st_mtime_ns))
+        except OSError:
+            continue
+    parts.sort()
+    return tuple(parts)
+
+
+def search_notes(query: str, scope: str = "all", limit: int = 30) -> list[dict[str, object]]:
+    query = query.strip().casefold()
+    if len(query) < 2:
+        return []
+    scope_prefixes = {
+        "all": "",
+        "create": area_prefix("create_dir"),
+        "knowledge": area_prefix("knowledge_dir"),
+        "sources": area_prefix("sources_dir"),
+        "published": area_prefix("published_dir"),
+    }
+    prefix = scope_prefixes.get(scope, "")
+    scored: list[tuple[int, float, dict[str, object]]] = []
+    for path in markdown_files():
+        rel = relative(path)
+        if prefix and not rel.startswith(prefix):
+            continue
+        text = try_read(path)
+        if text is None:
+            continue
+        title = title_of(path, text)
+        title_folded = title.casefold()
+        content = without_frontmatter(text)
+        body_folded = content.casefold()
+        meta_folded = " ".join(parse_frontmatter(text).values()).casefold()
+        if query not in title_folded and query not in body_folded and query not in meta_folded and query not in rel.casefold():
+            continue
+        score = 3 if query in title_folded else 2 if query in rel.casefold() else 1
+        index = body_folded.find(query)
+        start = max(0, index - 90) if index >= 0 else 0
+        excerpt = plain_excerpt(content[start : start + 420], 190)
+        meta = parse_frontmatter(text)
+        item = {
+            "path": rel,
+            "title": title,
+            "excerpt": excerpt,
+            "kind": meta.get("kind", ""),
+            "status": meta.get("status", ""),
+            "obsidian_uri": obsidian_uri(path),
+        }
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        scored.append((score, mtime, item))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [row[2] for row in scored[:limit]]
+
+
+def choose_review_action(rel_path: str, action: str | None) -> dict[str, object]:
+    if not ACTION_LABELS:
+        raise ValueError(
+            f"审核功能未启用：缺少协议文件 {REVIEW_PROTOCOL_FILE}，补上后重启工作台"
+        )
+    candidate = (VAULT / rel_path).resolve()
+    review_root = REVIEW_DIR.resolve()
+    if candidate.parent != review_root or candidate.suffix != ".md" or not candidate.exists():
+        raise ValueError("找不到这张审核卡")
+    text = read_text(candidate)
+    meta = parse_frontmatter(text)
+    if meta.get("status") != STATUS_PENDING:
+        raise ValueError("这张卡已经处理，刷新后再试")
+    if action is not None:
+        action = ACTION_KEY_ALIASES.get(action, action)
+        if action == "topic" and meta.get("knowledge_auto_at"):
+            action = "both"
+    if action is not None and action not in ACTION_LABELS:
+        raise ValueError("不支持这个审核选择")
+
+    matches = list(ACTION_PATTERN.finditer(text))
+    if len(matches) < 4:
+        raise ValueError("这张审核卡格式不完整，请在 Obsidian 中检查")
+    choices = "\n".join(
+        f"- [{'x' if action == key else ' '}] {label}"
+        for key, label in ACTION_LABELS.items()
+    )
+    updated = text[: matches[0].start()] + choices + text[matches[-1].end() :]
+    atomic_write(candidate, updated)
+    return {
+        "ok": True,
+        "action": action,
+        "label": ACTION_LABELS.get(action or "", "已撤销选择"),
+        "path": rel_path,
+    }
+
+
+def choose_topic_map_candidate(candidate_id: str, action: str) -> dict[str, object]:
+    if action not in {"approve", "watch", "dismiss"}:
+        raise ValueError("不支持这个主题地图候选动作")
+    result = apply_topic_map_candidate_action(
+        VAULT,
+        TOPIC_MAP_CANDIDATE_STATE,
+        candidate_id,
+        action,
+        VAULT / TOPIC_MAP_CANDIDATE_NOTE_REL,
+    )
+    log_operation(
+        {
+            "operation": "topic-map-candidate",
+            "candidate_id": candidate_id,
+            "action": action,
+            "map_file": result.get("map_file", ""),
+        }
+    )
+    return result
+
+
+CAPTURE_URL_PATTERN = re.compile(r"https?://[^\s<>\"）)】]+")
+
+
+def append_capture(text: str) -> dict[str, object]:
+    text = text.strip()
+    if not text:
+        raise ValueError("先写下一句话")
+    if len(text) > 2000:
+        raise ValueError("灵感太长了，请控制在 2000 字以内")
+    now = datetime.now().astimezone()
+    lines = text.splitlines()
+    match = CAPTURE_URL_PATTERN.search(lines[0])
+    if match:
+        # 首行带链接的速记直接投链接收件箱，走采集管线抓取，而不是躺在灵感箱里
+        if not LINK_INBOX_FILE.exists():
+            raise ValueError("找不到链接收件箱")
+        url = match.group(0).rstrip(".,;，。；")
+        note = (lines[0][: match.start()] + lines[0][match.end():]).strip(" -[]\t·")
+        extra = " ".join(line.strip() for line in lines[1:] if line.strip())
+        note = " ".join(part for part in (note, extra) if part)[:200]
+        entry = f"- [ ] {url}" + (f" {note}" if note else "")
+        current = read_text(LINK_INBOX_FILE).rstrip()
+        atomic_write(LINK_INBOX_FILE, current + "\n" + entry + "\n")
+        log_operation({"op": "capture-link", "url": url})
+        return {
+            "ok": True,
+            "target": "link-inbox",
+            "captured_at": now.isoformat(timespec="minutes"),
+            "url": url,
+        }
+    if not INBOX_FILE.exists():
+        raise ValueError("找不到灵感收件箱")
+    entry = f"- {now.strftime('%Y-%m-%d %H:%M')} · {lines[0].strip()}"
+    if len(lines) > 1:
+        entry += "\n" + "\n".join(f"  {line.rstrip()}" for line in lines[1:])
+    current = read_text(INBOX_FILE).rstrip()
+    atomic_write(INBOX_FILE, current + "\n\n" + entry + "\n")
+    return {
+        "ok": True,
+        "target": "inbox",
+        "captured_at": now.isoformat(timespec="minutes"),
+        "text": text,
+    }
+
+
+IGNORED_PARTS = {".git", ".obsidian", "node_modules", "__pycache__"}
+
+
+def contain_in_vault(rel_path: str) -> Path:
+    """把请求路径钉死在 vault 内：按 resolve 后的根做越界判断，返回以 VAULT 为基准的路径。"""
+    if not rel_path or rel_path.startswith(("/", "~")):
+        raise ValueError("找不到这篇笔记")
+    try:
+        rel = (VAULT / rel_path).resolve().relative_to(VAULT.resolve())
+    except (ValueError, OSError):
+        raise ValueError("找不到这篇笔记")
+    if any(part in IGNORED_PARTS for part in rel.parts):
+        raise ValueError("找不到这篇笔记")
+    return VAULT / rel
+
+
+def vault_note_path(rel_path: str) -> Path:
+    candidate = contain_in_vault(rel_path)
+    if candidate.suffix != ".md":
+        raise ValueError("找不到这篇笔记")
+    if not candidate.is_file():
+        raise ValueError("这篇笔记不存在，可能刚被移动；请刷新后再试")
+    return candidate
+
+
+def resolve_wikilink(target: str) -> Path | None:
+    """按 Obsidian 习惯解析双链：优先当相对路径，其次按文件名全库匹配。"""
+    target = target.split("|", 1)[0].split("#", 1)[0].strip().strip("/")
+    if not target:
+        return None
+    if "/" in target:
+        for suffix in ("", ".md"):
+            try:
+                return vault_note_path(target + suffix)
+            except ValueError:
+                continue
+    stem = target[:-3] if target.lower().endswith(".md") else target
+    stem = stem.casefold()
+    matches = [path for path in markdown_files() if path.stem.casefold() == stem]
+    if not matches:
+        return None
+    return min(matches, key=lambda path: len(relative(path)))
+
+
+def note_payload(rel_path: str = "", link: str = "") -> dict[str, object]:
+    if rel_path:
+        path = vault_note_path(rel_path)
+    else:
+        resolved = resolve_wikilink(link)
+        if resolved is None:
+            raise ValueError(f"没有找到「{link.strip()}」对应的笔记")
+        path = resolved
+    text = read_text(path)
+    meta = parse_frontmatter(text)
+    rel = relative(path)
+    can_record_publish = (
+        rel.startswith(area_prefix("published_dir"))
+        and not rel.startswith(area_prefix("feedback_dir"))
+    ) or meta.get("kind", "") in PUBLISH_ARCHIVE_RULES
+    return {
+        "ok": True,
+        "path": rel,
+        "title": title_of(path, text),
+        "frontmatter": meta,
+        "body": without_frontmatter(text),
+        "source_note": resolve_note_ref(meta.get("source_file", "")),
+        "publish": publish_panel(meta),
+        "feedback": feedback_panel(text, meta),
+        "kind": meta.get("kind", ""),
+        "status": meta.get("status", ""),
+        "can_record_publish": can_record_publish,
+        # 字符串透传：mtime_ns 超出 JS 安全整数范围，数字形式会在浏览器里丢精度
+        "mtime_ns": str(path.stat().st_mtime_ns),
+        "obsidian_uri": obsidian_uri(path),
+    }
+
+
+# ---------- 视频文案（本机加，10-28）：把采集下来的抖音、小红书来源卡整理成能看、能复制的文案 ----------
+
+VIDEO_TIME_LINE = re.compile(r"^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.*)$")
+VIDEO_STAT_KEYS = ("like", "comment", "collect", "share")
+
+
+def md_section(body: str, heading: str) -> str:
+    """取「## heading…」这一节的正文（标题按前缀匹配），到下一个二级标题为止。"""
+    match = re.search(r"^## " + re.escape(heading) + r"[^\n]*\n(.*?)(?=^## |\Z)", body, re.M | re.S)
+    return match.group(1).strip() if match else ""
+
+
+def video_stats(value: str) -> dict[str, int | None]:
+    parts = [part.strip() for part in str(value or "").split("/")]
+    numbers = [int(part) if part.isdigit() else None for part in parts] + [None] * 4
+    return dict(zip(VIDEO_STAT_KEYS, numbers[:4]))
+
+
+def asr_cleaner():
+    """用知识采集里同一套规则去掉语音识别的幻听；模块不在就原样返回。"""
+    try:
+        return video_capture_module().clean_asr_text
+    except (ValueError, OSError, AttributeError):
+        return lambda value: value
+
+
+def video_entry(path: Path, text: str, full: bool = False) -> dict[str, object]:
+    meta = parse_frontmatter(text)
+    body = without_frontmatter(text)
+    clean = asr_cleaner()
+    lines, raw_lines = [], 0
+    for line in md_section(body, "带时间稿").splitlines():
+        match = VIDEO_TIME_LINE.match(line.strip())
+        if match and match.group(2).strip():
+            raw_lines += 1
+            words = clean(match.group(2).strip())  # 去掉没听到人声时的“幻听”（10-28）
+            if words:
+                lines.append({"t": match.group(1), "text": words})
+    plain = "".join(line["text"] for line in lines)
+    count = re.search(r"字数：约\s*(\d+)", md_section(body, "文字稿"))
+    if raw_lines != len(lines):
+        count = None  # 去掉了幻听的句子，简报里的字数不准了，按剩下的算
+    media_dir = meta.get("media_dir", "").strip().strip("/")
+    wall = f"{media_dir}/wall.jpg" if media_dir and (VAULT / media_dir / "wall.jpg").is_file() else ""
+    try:
+        duration = int(meta.get("duration_seconds") or 0)
+    except ValueError:
+        duration = 0
+    entry: dict[str, object] = {
+        "path": relative(path),
+        "title": title_of(path, text),
+        "platform": meta.get("platform", ""),
+        "author": meta.get("author", ""),
+        "published_at": meta.get("source_published_at", ""),
+        "captured_at": meta.get("created_at", ""),
+        "duration": duration,
+        "stats": video_stats(meta.get("stats_like_comment_collect_share", "")),
+        "url": web_url(meta.get("source_url", "")),
+        "chars": int(count.group(1)) if count else len(re.sub(r"[^\w]+", "", plain)),
+        "has_transcript": bool(lines),
+        "fans": int(meta["author_fans"]) if meta.get("author_fans", "").isdigit() else None,
+        "from_radar": bool(meta.get("radar_id")),
+        "note_type": meta.get("note_type", ""),
+        "wall": wall,
+        "obsidian_uri": obsidian_uri(path),
+    }
+    if full:
+        hook = clean(md_section(body, "开头 8 秒原文"))
+        entry.update(
+            hook="" if hook.startswith("【") else hook,
+            desc=md_section(body, "作品描述"),
+            lines=lines,
+            text=plain,
+        )
+    return entry
+
+
+def videos_payload() -> dict[str, object]:
+    folder = VAULT / LAYOUT["video_clips_dir"]
+    rows = []
+    if folder.is_dir():
+        for path in folder.glob("*.md"):
+            text = try_read(path)
+            if text is not None and parse_frontmatter(text).get("platform"):
+                rows.append(video_entry(path, text))
+    rows.sort(key=lambda row: str(row["captured_at"]), reverse=True)
+    return {"items": rows, "folder": LAYOUT["video_clips_dir"]}
+
+
+def video_payload(rel_path: str) -> dict[str, object]:
+    path = vault_note_path(rel_path)
+    if not relative(path).startswith(area_prefix("video_clips_dir")):
+        raise ValueError("这不是视频文案")
+    return video_entry(path, read_text(path), full=True)
+
+
+# ---------- 嵌入、查询与笔记内交互：让工作台不必跳回 Obsidian ----------
+
+
+def vault_note_rows() -> list[tuple[str, str, dict]]:
+    rows = []
+    for path in markdown_files():
+        text = try_read(path)
+        if text is not None:
+            rows.append((relative(path), path.stem, parse_frontmatter(text)))
+    return rows
+
+
+def link_target(value: str) -> str:
+    """frontmatter 里的「[[路径|别名]]」或纯路径 → 路径。"""
+    value = str(value or "").strip()
+    match = re.match(r"^\[\[([^\]|#]+)", value)
+    return (match.group(1) if match else value).strip()
+
+
+def resolve_note_ref(value: str) -> str:
+    """把 source_file / draft_source 这类引用解析成 vault 内笔记路径；找不到返回空串。"""
+    target = link_target(value)
+    if not target or target.startswith(("http://", "https://")):
+        return ""
+    for candidate in (target, target + ".md"):
+        try:
+            return relative(vault_note_path(candidate))
+        except ValueError:
+            continue
+    resolved = resolve_wikilink(target)
+    return relative(resolved) if resolved else ""
+
+
+def find_base_file(target: str) -> Path:
+    target = target.strip().strip("/")
+    try:
+        direct = contain_in_vault(target)
+        if direct.is_file() and direct.suffix == ".base":
+            return direct
+    except ValueError:
+        pass
+    name = Path(target).name.casefold()
+    for path in VAULT.rglob("*.base"):
+        if path.name.casefold() == name and not any(p in IGNORED_PARTS for p in path.relative_to(VAULT).parts):
+            return path
+    raise ValueError(f"没有找到视图「{target}」")
+
+
+def embed_payload(link: str) -> dict[str, object]:
+    target, _, fragment = link.partition("#")
+    target, fragment = target.strip(), fragment.strip()
+    if target.lower().endswith(".base"):
+        path = find_base_file(target)
+        result = obsidian_views.run_base(read_text(path), fragment, vault_note_rows())
+        result.update({"ok": True, "path": relative(path), "title": path.stem})
+        return result
+    path = resolve_wikilink(target)
+    if path is None:
+        raise ValueError(f"没有找到「{target}」对应的笔记")
+    text = read_text(path)
+    body = without_frontmatter(text)
+    section = ""
+    if fragment and not fragment.startswith("^"):
+        section = obsidian_views.heading_section(body, fragment)
+    return {
+        "ok": True,
+        "type": "note",
+        "path": relative(path),
+        "title": title_of(path, text),
+        "heading": fragment if section else "",
+        "body": (section or body)[:60_000],
+    }
+
+
+def query_payload(query: str, limit: int = 50) -> dict[str, object]:
+    try:
+        node = obsidian_views.parse_query(query)
+    except obsidian_views.Unsupported as exc:
+        raise ValueError(f"这个查询写法工作台还不支持：{exc}")
+    prefixes = obsidian_views.query_prefilter(node)
+    rows = []
+    for path in markdown_files():
+        rel = relative(path)
+        if prefixes and not all(prefix in rel.casefold() for prefix in prefixes):
+            continue
+        cache: dict[str, str] = {}
+
+        def text_of(path: Path = path, cache: dict[str, str] = cache) -> str:
+            if "text" not in cache:
+                cache["text"] = try_read(path) or ""
+            return cache["text"]
+
+        if obsidian_views.match_query(node, rel, text_of):
+            text = text_of()
+            meta = parse_frontmatter(text)
+            rows.append({
+                "path": rel,
+                "title": title_of(path, text),
+                "kind": meta.get("kind", ""),
+                "status": meta.get("status", ""),
+                "modified": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="minutes"),
+            })
+    rows.sort(key=lambda row: row["modified"], reverse=True)
+    return {"ok": True, "type": "query", "total": len(rows), "rows": rows[:limit]}
+
+
+def split_note(text: str) -> tuple[str, str]:
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end >= 0:
+            return text[: end + 5], text[end + 5 :]
+    return "", text
+
+
+def checked_mtime(path: Path, expected_mtime_ns: object) -> None:
+    try:
+        expected = int(expected_mtime_ns)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError("请求格式不正确")
+    if path.stat().st_mtime_ns != expected:
+        raise ValueError("这篇笔记刚被其他程序修改过，请刷新后再操作")
+
+
+TASK_LINE = re.compile(r"^(\s*[-*+]\s+)\[([ xX])\](.*)$")
+PLAIN_BULLET = re.compile(r"^(\s*[-*+]\s+)(?!\[[ xX]\])(\S.*)$")
+
+
+def toggle_task(rel_path: str, line: object, checked: object, expected_mtime_ns: object) -> dict[str, object]:
+    """勾选或取消正文里的一条任务（如「待确认」「回写检查」），只改这一行。"""
+    path = vault_note_path(rel_path)
+    checked_mtime(path, expected_mtime_ns)
+    head, body = split_note(read_text(path))
+    lines = body.split("\n")
+    try:
+        index = int(line)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError("请求格式不正确")
+    line_text = lines[index] if 0 <= index < len(lines) else ""
+    match = TASK_LINE.match(line_text)
+    plain = PLAIN_BULLET.match(line_text) if not match else None
+    if match:
+        lines[index] = f"{match.group(1)}[{'x' if checked else ' '}]{match.group(3)}"
+    elif plain and checked:
+        # 「待确认」常写成普通列表；勾上时就地改成任务行，Obsidian 里看到的是同一个勾
+        lines[index] = f"{plain.group(1)}[x] {plain.group(2)}"
+    else:
+        raise ValueError("这一行已经不是勾选项，请刷新后再试")
+    atomic_write(path, head + "\n".join(lines))
+    log_operation({"op": "task", "path": relative(path), "line": index, "checked": bool(checked)})
+    return {"ok": True, "path": relative(path), "mtime_ns": str(path.stat().st_mtime_ns)}
+
+
+# ---------- 发布面板 ----------
+
+PUBLISH_PLATFORM_KEYS = (
+    ("x_article", "X Article", ("X Article", "X 长文", "X长文")),
+    ("wechat", "公众号", ("公众号",)),
+    ("shipinhao", "视频号", ("视频号",)),
+    ("douyin", "抖音", ("抖音",)),
+    ("xiaohongshu", "小红书", ("小红书",)),
+)
+MEDIA_FIELDS = {"video_file"}
+MEDIA_TYPES = {".mp4": "video/mp4", ".m4v": "video/x-m4v", ".mov": "video/quicktime", ".webm": "video/webm"}
+
+
+def vault_relative_asset(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw).expanduser()
+    try:
+        rel = candidate.resolve().relative_to(VAULT.resolve()).as_posix() if candidate.is_absolute() else raw
+        return rel if (VAULT / rel).is_file() and (VAULT / rel).suffix.lower() in ASSET_TYPES else ""
+    except (ValueError, OSError):
+        return ""
+
+
+def media_file(rel_path: str, field: str) -> Path:
+    if field not in MEDIA_FIELDS:
+        raise ValueError("不支持这个媒体字段")
+    meta = parse_frontmatter(read_text(vault_note_path(rel_path)))
+    raw = meta.get(field, "").strip()
+    path = Path(raw).expanduser() if raw else None
+    if path is None or not path.is_absolute() or path.suffix.lower() not in MEDIA_TYPES or not path.is_file():
+        raise ValueError("视频文件不在本机或已被移动")
+    return path
+
+
+def web_url(value: str) -> str:
+    value = str(value or "").strip()
+    return value if value.startswith(("http://", "https://")) else ""
+
+
+def publish_panel(meta: dict[str, str]) -> dict[str, object] | None:
+    platform_text = meta.get("platform", "")
+    rows = []
+    for key, label, aliases in PUBLISH_PLATFORM_KEYS:
+        status = meta.get(f"{key}_status", "")
+        url = web_url(meta.get(f"{key}_url", "") or (meta.get("wechat_public_url", "") if key == "wechat" else ""))
+        draft_status = meta.get(f"{key}_draft_status", "") or (meta.get("wechat_draft_status", "") if key == "wechat" else "")
+        draft_url = web_url(meta.get(f"{key}_draft_url", ""))
+        published_at = meta.get(f"{key}_published_at", "") or (meta.get("wechat_published_at", "") if key == "wechat" else "")
+        mentioned = any(alias in platform_text for alias in aliases)
+        if not (status or url or draft_status or draft_url or mentioned):
+            continue
+        rows.append({
+            "key": key,
+            "label": label,
+            "status": status or ("published" if url else draft_status),
+            "url": url,
+            "draft_url": draft_url,
+            "published_at": published_at,
+            "data_status": meta.get(f"{key}_data_status", ""),
+        })
+    covers = [
+        {"label": label, "path": rel}
+        for label, rel in (
+            ("X 封面", vault_relative_asset(meta.get("x_article_cover", ""))),
+            ("公众号封面", vault_relative_asset(meta.get("wechat_draft_cover", ""))),
+        )
+        if rel
+    ]
+    links = [
+        {"label": label, "path": resolved}
+        for label, field in (
+            ("反馈卡", "feedback_file"),
+            ("母稿", "draft_source"),
+            ("成稿包", "content_pack"),
+            ("正式稿", "published_file"),
+            ("发布稿", "article"),
+        )
+        if (resolved := resolve_note_ref(meta.get(field, "")))
+    ]
+    video = meta.get("video_file", "").strip()
+    has_video = bool(video) and Path(video).expanduser().is_file() and Path(video).suffix.lower() in MEDIA_TYPES
+    if not (rows or covers or has_video):
+        return None
+    return {"platforms": rows, "covers": covers, "links": links, "video": has_video}
+
+
+# ---------- 发布反馈：网页里直接复盘 ----------
+
+FEEDBACK_SCRIPT_DIR = HERE.parent / "反馈复盘"
+if str(FEEDBACK_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(FEEDBACK_SCRIPT_DIR))
+try:
+    import feedback_snapshot
+except ModuleNotFoundError:  # 反馈复盘脚本缺失时，网页复盘入口自动隐藏
+    feedback_snapshot = None  # type: ignore[assignment]
+
+METRIC_SECTION = re.compile(r"快照|^24\s*小时$|^7\s*天$")
+METRIC_SKIP_LABELS = {"抓取时间"}
+METRIC_BULLET = re.compile(r"^- ([^：]+)：(.*)$")
+
+
+def feedback_fields(body: str) -> list[dict[str, object]]:
+    fields = []
+    section = platform = ""
+    for index, line in enumerate(body.split("\n")):
+        heading = re.match(r"^(#{2,3})\s+(.*?)\s*$", line)
+        if heading:
+            if heading.group(1) == "##":
+                section, platform = heading.group(2), ""
+            else:
+                platform = heading.group(2)
+            continue
+        bullet = METRIC_BULLET.match(line)
+        if bullet and METRIC_SECTION.search(section) and bullet.group(1) not in METRIC_SKIP_LABELS:
+            fields.append({
+                "line": index,
+                "section": section,
+                "platform": platform,
+                "label": bullet.group(1),
+                "value": bullet.group(2).strip(),
+            })
+    return fields
+
+
+def captured_metrics(text: str) -> dict[str, int]:
+    """优先 7 天快照，其次 24 小时快照；只认能对上 X 口径的数字。"""
+    keys = {"浏览": "impression_count", "曝光": "impression_count", "播放": "impression_count",
+            "点赞": "like_count", "收藏": "bookmark_count", "评论": "reply_count",
+            "评论与私信": "reply_count", "转发": "retweet_count", "分享": "retweet_count"}
+    by_section: dict[str, dict[str, int]] = {}
+    for field in feedback_fields(without_frontmatter(text)):
+        value = str(field["value"]).replace(",", "")
+        if field["label"] in keys and re.fullmatch(r"\d+", value):
+            bucket = by_section.setdefault("7d" if "7" in str(field["section"]) else "24h", {})
+            bucket.setdefault(keys[str(field["label"])], int(value))
+    return by_section.get("7d") or by_section.get("24h") or {}
+
+
+def feedback_panel(text: str, meta: dict[str, str]) -> dict[str, object] | None:
+    if meta.get("kind") not in {"content-feedback", "publication-feedback", "feedback"}:
+        return None
+    done = meta.get("status", "").strip().lower() in COMPLETED_FEEDBACK_STATUSES
+    panel: dict[str, object] = {
+        "fields": feedback_fields(without_frontmatter(text)),
+        "done": done,
+        "verdict": meta.get("verdict", ""),
+        "verdicts": [],
+        "suggested": "",
+        "signal": "",
+    }
+    if feedback_snapshot is not None:
+        key, signal = feedback_snapshot.interpret(captured_metrics(text) or None)
+        panel.update({
+            "verdicts": [label for _, label in feedback_snapshot.VERDICTS],
+            "suggested": feedback_snapshot.VERDICT_LABELS.get(key, ""),
+            "signal": signal,
+        })
+    return panel
+
+
+def save_feedback_metrics(rel_path: str, values: object, expected_mtime_ns: object) -> dict[str, object]:
+    path = vault_note_path(rel_path)
+    if not relative(path).startswith(area_prefix("feedback_dir")):
+        raise ValueError("只能给发布反馈卡填数据")
+    if not isinstance(values, dict) or not values:
+        raise ValueError("没有要保存的数据")
+    checked_mtime(path, expected_mtime_ns)
+    head, body = split_note(read_text(path))
+    lines = body.split("\n")
+    allowed = {int(field["line"]): field for field in feedback_fields(body)}
+    changed = 0
+    for raw_line, raw_value in values.items():
+        try:
+            index = int(raw_line)
+        except (TypeError, ValueError):
+            raise ValueError("请求格式不正确")
+        field = allowed.get(index)
+        if field is None:
+            raise ValueError("反馈卡结构刚变过，请刷新后再填")
+        value = " ".join(str(raw_value).split())[:200]
+        rendered = f"- {field['label']}：{value}"
+        if lines[index] != rendered:
+            lines[index] = rendered
+            changed += 1
+    if changed:
+        atomic_write(path, head + "\n".join(lines))
+        log_operation({"op": "feedback-metrics", "path": relative(path), "fields": changed})
+    return {"ok": True, "path": relative(path), "changed": changed, "mtime_ns": str(path.stat().st_mtime_ns)}
+
+
+def record_feedback_verdict(rel_path: str, verdict: str, reason: str) -> dict[str, object]:
+    if feedback_snapshot is None:
+        raise ValueError("反馈复盘脚本不在，暂时不能在工作台复盘")
+    path = vault_note_path(rel_path)
+    if not relative(path).startswith(area_prefix("feedback_dir")):
+        raise ValueError("只能对发布反馈卡下复盘结论")
+    if verdict not in feedback_snapshot.VERDICT_LABELS.values():
+        raise ValueError("不认识这个复盘结论")
+    now = datetime.now().astimezone()
+    reason = " ".join(str(reason).split())[:300]
+    ok, message = feedback_snapshot.apply_verdict(VAULT, path.stem, verdict, reason, now)
+    if not ok:
+        raise ValueError(message)
+    try:  # 同步刷新 Obsidian 里的「反馈复盘」清单，避免同一条还挂着待勾选
+        board = feedback_snapshot.render_board(VAULT, now, [message])
+        atomic_write(VAULT / feedback_snapshot.WORKBENCH_REL, board)
+    except Exception:  # 清单下一轮定时任务也会重建，失败不影响结论本身
+        traceback.print_exc()
+    log_operation({"op": "feedback-verdict", "path": relative(path), "verdict": verdict})
+    return {"ok": True, "path": relative(path), "message": message}
+
+
+# ---------- 发布表现与健康问题 ----------
+
+
+def load_performance(files: list[Path], limit: int = 24) -> list[dict[str, object]]:
+    """各篇发布内容的最近一次数据快照；系列取正式稿的 series 属性。"""
+    prefix = area_prefix("feedback_dir")
+    rows = []
+    for path in files:
+        if not relative(path).startswith(prefix) or path.name == "README.md":
+            continue
+        text = try_read(path) or ""
+        meta = parse_frontmatter(text)
+        metrics = captured_metrics(text)
+        if not metrics.get("impression_count"):
+            continue
+        article_rel = resolve_note_ref(meta.get("article", ""))
+        article_meta = parse_frontmatter(try_read(VAULT / article_rel) or "") if article_rel else {}
+        views = metrics.get("impression_count", 0)
+        rows.append({
+            "path": relative(path),
+            "article": article_rel,
+            "title": article_meta.get("title") or (title_of(VAULT / article_rel, try_read(VAULT / article_rel) or "") if article_rel else path.stem),
+            "date": (meta.get("published_at") or meta.get("publication_confirmed_at") or meta.get("created_at", ""))[:10],
+            "platform": meta.get("platform", ""),
+            "series": article_meta.get("series", "") or "未分系列",
+            "views": views,
+            "likes": metrics.get("like_count", 0),
+            "bookmarks": metrics.get("bookmark_count", 0),
+            "replies": metrics.get("reply_count", 0),
+            "bookmark_rate": round(metrics.get("bookmark_count", 0) / views * 100, 2) if views else 0,
+        })
+    rows.sort(key=lambda row: str(row["date"]), reverse=True)
+    return rows[:limit]
+
+
+HEALTH_ISSUE_GROUPS = (
+    ("broken_links", "无法解析的链接", lambda item: (item.get("source", ""), f"指向「{item.get('target', '')}」")),
+    ("published_metadata_issues", "发布资料待补", lambda item: (item.get("file", ""), "；".join(item.get("issues", [])))),
+    ("feedback_schedule_issues", "反馈排期异常", lambda item: (item.get("file", ""), item.get("issue", ""))),
+    ("published_active_residue_issues", "发布后未收尾", lambda item: (item.get("file", ""), item.get("issue", ""))),
+    ("underlinked_knowledge", "连接太少的知识", lambda item: (item.get("file", ""), f"只有 {item.get('internal_links', 0)} 条内部连接")),
+)
+
+
+def latest_snapshot_raw() -> dict[str, object]:
+    snapshot_dir = STATE_HOME / "health-snapshots"
+    files = sorted(snapshot_dir.glob("*.json")) if snapshot_dir.exists() else []
+    return load_json_file(files[-1], {}) if files else {}
+
+
+def health_issue_groups(per_group: int = 30) -> list[dict[str, object]]:
+    snapshot = latest_snapshot_raw()
+    groups = []
+    for key, label, describe in HEALTH_ISSUE_GROUPS:
+        items = [item for item in snapshot.get(key, []) or [] if isinstance(item, dict)]
+        if not items:
+            continue
+        rows = []
+        for item in items[:per_group]:
+            rel, detail = describe(item)
+            rel = str(rel)
+            openable = rel.endswith(".md") and (VAULT / rel).is_file()
+            rows.append({"path": rel, "title": Path(rel).stem or rel, "detail": str(detail), "openable": openable})
+        groups.append({"key": key, "label": label, "count": len(items), "items": rows})
+    return groups
+
+
+ASSET_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+}
+ASSET_SIZE_LIMIT = 26_214_400
+_ASSET_INDEX: dict[str, object] = {"at": 0.0, "names": {}}
+
+
+def asset_index() -> dict[str, Path]:
+    """文件名 → 附件路径的索引；vault 很大，缓存两分钟避免每张图都全库扫描。"""
+    now = time.monotonic()
+    if now - float(_ASSET_INDEX["at"]) > 120 or not _ASSET_INDEX["names"]:
+        names: dict[str, Path] = {}
+        for path in VAULT.rglob("*"):
+            if path.suffix.lower() not in ASSET_TYPES or not path.is_file():
+                continue
+            rel_parts = path.relative_to(VAULT).parts
+            if any(part in IGNORED_PARTS for part in rel_parts):
+                continue
+            key = path.name.casefold()
+            if key not in names or len(relative(path)) < len(relative(names[key])):
+                names[key] = path
+        _ASSET_INDEX["names"] = names
+        _ASSET_INDEX["at"] = now
+    return _ASSET_INDEX["names"]  # type: ignore[return-value]
+
+
+def find_asset(rel_path: str = "", link: str = "") -> Path:
+    candidate: Path | None = None
+    if rel_path:
+        try:
+            direct = contain_in_vault(rel_path)
+            candidate = direct if direct.is_file() else None
+        except ValueError:
+            candidate = None
+    elif link:
+        link = link.split("|", 1)[0].strip().strip("/")
+        if "/" in link:
+            try:
+                direct = contain_in_vault(link)
+                candidate = direct if direct.is_file() else None
+            except ValueError:
+                candidate = None
+        if candidate is None and link:
+            candidate = asset_index().get(Path(link).name.casefold())
+    if candidate is None or candidate.suffix.lower() not in ASSET_TYPES or not candidate.is_file():
+        raise ValueError("找不到这个附件")
+    if candidate.stat().st_size > ASSET_SIZE_LIMIT:
+        raise ValueError("附件太大，请在 Obsidian 中查看")
+    return candidate
+
+
+def apply_transition(
+    rel_path: str, to_status: str, expected_mtime_ns: int | None
+) -> dict[str, object]:
+    path = vault_note_path(rel_path)
+    rel = relative(path)
+    text = read_text(path)
+    meta = parse_frontmatter(text)
+    group = BOARD_KIND_MAP.get(meta.get("kind", ""))
+    if group is None:
+        raise ValueError("这类笔记不支持在工作台改状态")
+    if not any(rel.startswith(prefix) for prefix in group["prefixes"]):
+        raise ValueError("这篇笔记不在对应的工作目录里，请在 Obsidian 中处理")
+    from_status = meta.get("status", "").strip()
+    transition = next(
+        (
+            t
+            for t in group["transitions"]
+            if t["from"] == from_status and t["to"] == to_status
+        ),
+        None,
+    )
+    if transition is None:
+        label = group["status_labels"].get(from_status, from_status or "未标记")
+        raise ValueError(f"当前状态「{label}」不支持这个流转，可能刚被其他流程更新；请刷新后再试")
+    if expected_mtime_ns is not None:
+        try:
+            expected = int(expected_mtime_ns)
+        except (TypeError, ValueError):
+            raise ValueError("请求格式不正确")
+        if path.stat().st_mtime_ns != expected:
+            raise ValueError("这篇笔记刚被其他程序修改过，请刷新后再试")
+    updates: dict[str, str] = {"status": to_status}
+    for key, value in {**group["set_on_change"], **transition["set"]}.items():
+        updates[key] = resolve_set_value(value)
+    if meta.get("kind") == "topic-candidate":
+        if to_status == "candidate":
+            now = datetime.now().astimezone()
+            updates.update(
+                {
+                    "attention_entered_at": now.isoformat(timespec="seconds"),
+                    "attention_until": (
+                        now.date() + timedelta(days=TOPIC_ATTENTION_DAYS)
+                    ).isoformat(),
+                    "attention_status": "fresh",
+                    "review_after": (
+                        now.date() + timedelta(days=TOPIC_ATTENTION_DAYS)
+                    ).isoformat(),
+                    "closed_at": "",
+                    "closed_reason": "",
+                }
+            )
+        elif to_status in {"parked", "closed"}:
+            updates["attention_status"] = "inactive"
+    atomic_write(path, update_frontmatter_text(text, updates))
+    log_operation({"op": "transition", "path": rel, "from": from_status, "to": to_status})
+    return {
+        "ok": True,
+        "path": rel,
+        "from": from_status,
+        "to": to_status,
+        "label": str(transition["label"]),
+        "to_label": group["status_labels"].get(to_status, to_status),
+        "mtime_ns": str(path.stat().st_mtime_ns),
+    }
+
+
+def promote_candidate(rel_path: str, angle: str) -> dict[str, object]:
+    """立项走既有管线命令，工作台只负责校验入参和转述结果。"""
+    angle = " ".join(angle.split())
+    if not angle:
+        raise ValueError("先用一句话写清本次角度")
+    if len(angle) > 120:
+        raise ValueError("角度请控制在 120 字以内")
+    path = vault_note_path(rel_path)
+    rel = relative(path)
+    topic_prefixes = (area_prefix("topics_dir"), area_prefix("topic_reserve_dir"))
+    if not rel.startswith(topic_prefixes):
+        raise ValueError("只能对候选选题或选题储备立项")
+    if parse_frontmatter(read_text(path)).get("kind") != "topic-candidate":
+        raise ValueError("这篇笔记不是候选选题")
+    if not INGEST_SCRIPT.is_file():
+        raise ValueError("找不到知识采集脚本，无法在工作台立项")
+    env = {**os.environ, "RAYS_BRAIN": str(VAULT), "RAYS_BRAIN_STATE": str(STATE_HOME)}
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-X", "utf8", str(INGEST_SCRIPT), "promote", rel, "--angle", angle],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            cwd=str(INGEST_SCRIPT.parent),
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("立项超时，请稍后在终端重试")
+    if completed.returncode != 0:
+        stderr_lines = [line.strip() for line in completed.stderr.splitlines() if line.strip()]
+        message = stderr_lines[-1] if stderr_lines else "未知错误"
+        message = message.split("ValueError:", 1)[-1].strip()
+        raise ValueError(f"立项失败：{message[:300]}")
+    stdout = completed.stdout
+    brace = stdout.find("{")
+    try:
+        data = json.loads(stdout[brace:]) if brace >= 0 else {}
+    except json.JSONDecodeError:
+        data = {}
+    task_rel = str(data.get("writing_task", ""))
+    log_operation({"op": "promote", "path": rel, "angle": angle, "writing_task": task_rel})
+    return {
+        "ok": True,
+        "promoted": str(data.get("promoted", rel)),
+        "writing_task": task_rel,
+        "angle": angle,
+    }
+
+
+def save_note_body(
+    rel_path: str, body: str, expected_mtime_ns: object
+) -> dict[str, object]:
+    """全文编辑只替换正文，页首属性原样保留——属性由流转和管线负责。"""
+    if len(body) > 512_000:
+        raise ValueError("正文太长，请回 Obsidian 编辑这一篇")
+    path = vault_note_path(rel_path)
+    if expected_mtime_ns is None:
+        raise ValueError("请求格式不正确")
+    try:
+        expected = int(expected_mtime_ns)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError("请求格式不正确")
+    if path.stat().st_mtime_ns != expected:
+        raise ValueError("这篇笔记刚被其他程序修改过；请复制你的改动，刷新后再编辑")
+    text = read_text(path)
+    head = ""
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end >= 0:
+            head = text[: end + 5]
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    if body and not body.endswith("\n"):
+        body += "\n"
+    atomic_write(path, head + body)
+    log_operation({"op": "edit", "path": relative(path), "chars": len(body)})
+    return {
+        "ok": True,
+        "path": relative(path),
+        "mtime_ns": str(path.stat().st_mtime_ns),
+    }
+
+
+_MANUAL_RUN: dict[str, object] = {"proc": None, "started_at": ""}
+
+
+def manual_run_running() -> bool:
+    proc = _MANUAL_RUN["proc"]
+    return proc is not None and proc.poll() is None  # type: ignore[union-attr]
+
+
+def start_manual_run(command: str = "run") -> dict[str, object]:
+    if command not in {"run", "actions"}:
+        raise ValueError("不支持这个采集命令")
+    if manual_run_running():
+        raise ValueError("已有一次手动采集在进行中，请等它跑完")
+    if not INGEST_SCRIPT.is_file():
+        raise ValueError("找不到知识采集脚本")
+    env = {**os.environ, "RAYS_BRAIN": str(VAULT), "RAYS_BRAIN_STATE": str(STATE_HOME)}
+    log_dir = STATE_HOME / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with (log_dir / "manual-run.log").open("a", encoding="utf-8") as handle:
+        handle.write(f"\n===== 工作台手动采集（{command}） {started_at} =====\n")
+        handle.flush()
+        proc = subprocess.Popen(
+            [sys.executable, "-X", "utf8", str(INGEST_SCRIPT), command],
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(INGEST_SCRIPT.parent),
+        )
+    _MANUAL_RUN["proc"] = proc
+    _MANUAL_RUN["started_at"] = started_at
+    log_operation({"op": "manual-run", "command": command, "started_at": started_at})
+    return {"ok": True, "started_at": started_at}
+
+
+_RADAR: dict[str, object] = {"module": None, "proc": None, "started_at": ""}
+
+
+def radar_module():
+    """爆款雷达是可选模块（kit 版可能没有），按文件路径懒加载。"""
+    if _RADAR["module"] is None:
+        if not RADAR_SCRIPT.is_file():
+            raise ValueError("没有安装爆款雷达")
+        os.environ.setdefault("RAYS_BRAIN_STATE", str(STATE_HOME))
+        spec = importlib.util.spec_from_file_location("radar", RADAR_SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader
+        spec.loader.exec_module(module)
+        _RADAR["module"] = module
+    return _RADAR["module"]
+
+
+def radar_run_running() -> bool:
+    proc = _RADAR["proc"]
+    return proc is not None and proc.poll() is None  # type: ignore[union-attr]
+
+
+def radar_payload() -> dict[str, object]:
+    if not RADAR_SCRIPT.is_file():
+        return {"installed": False}
+    view = radar_module().radar_view()
+    return {
+        "installed": True,
+        "running": radar_run_running(),
+        "run_started_at": _RADAR["started_at"] if radar_run_running() else "",
+        "transcripts": radar_transcripts(),
+        "keywords": radar_module().keywords_view(),
+        **view,
+    }
+
+
+def save_radar_keywords(douyin: object, xiaohongshu: object) -> dict[str, object]:
+    """本机加（11-02）：选题洞察页「管理关键词」保存。刷新进行中不改，免得这一轮用到一半的词变了。"""
+    if radar_run_running():
+        raise ValueError("选题洞察正在刷新，等它跑完再改关键词")
+    view = radar_module().save_keywords(douyin, xiaohongshu)
+    log_operation({"op": "radar-keywords", "douyin": view["douyin"], "xiaohongshu": view["xiaohongshu"]})
+    return {"ok": True, **view}
+
+
+# ---------- 选题洞察「取文案」（本机加，10-28） ----------
+# 点了就在后台下载 + 本地转写（复用知识采集的 video_capture），来源卡写进视频目录，
+# 视频文案页就能看到。只出文案、不出素材卡：不进采集的待审队列（采集只扫网页剪藏目录和
+# 链接收件箱），processing_status 写 transcript-only。一次只跑一条，其余排队。
+
+INGEST_DIR = HERE.parent / "知识采集"
+_TRANSCRIPT: dict[str, object] = {"module": None, "jobs": {}, "queue": [], "worker": None}
+_TRANSCRIPT_LOCK = threading.Lock()
+
+
+def video_capture_module():
+    if _TRANSCRIPT["module"] is None:
+        script = INGEST_DIR / "video_capture.py"
+        if not script.is_file():
+            raise ValueError("没有找到视频采集模块")
+        spec = importlib.util.spec_from_file_location("video_capture_for_radar", script)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader
+        spec.loader.exec_module(module)
+        _TRANSCRIPT["module"] = module
+    return _TRANSCRIPT["module"]
+
+
+def radar_transcripts() -> dict[str, dict[str, str]]:
+    """雷达条目 id → {status: queued/running/failed/done, path, error}。done 以视频目录里带 radar_id 的来源卡为准。"""
+    result: dict[str, dict[str, str]] = {}
+    folder = VAULT / LAYOUT["video_clips_dir"]
+    if folder.is_dir():
+        for path in folder.glob("*.md"):
+            radar_id = parse_frontmatter(try_read(path) or "").get("radar_id", "")
+            if radar_id:
+                result[radar_id] = {"status": "done", "path": relative(path)}
+    with _TRANSCRIPT_LOCK:
+        for radar_id, job in _TRANSCRIPT["jobs"].items():
+            if radar_id not in result and job.get("status") != "done":
+                result[radar_id] = dict(job)
+    return result
+
+
+def radar_item(item_id: str) -> dict[str, object]:
+    radar = radar_module()
+    item = radar.load_json(radar.ITEMS_FILE, {}).get(item_id)
+    if not item:
+        raise ValueError("选题洞察里没有这一条")
+    if item.get("platform") not in ("douyin", "xiaohongshu") or not web_url(item.get("url", "")):
+        raise ValueError("这一条没有可下载的链接")
+    return item
+
+
+def start_radar_transcript(item_id: str) -> dict[str, object]:
+    item = radar_item(item_id)
+    current = radar_transcripts().get(item_id, {})
+    if current.get("status") in ("done", "queued", "running"):
+        return {"ok": True, **current}
+    with _TRANSCRIPT_LOCK:
+        _TRANSCRIPT["jobs"][item_id] = {"status": "queued"}
+        _TRANSCRIPT["queue"].append(item)
+        worker = _TRANSCRIPT["worker"]
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(target=transcript_worker, name="radar-transcript", daemon=True)
+            _TRANSCRIPT["worker"] = worker
+            worker.start()
+    log_operation({"action": "radar-transcript", "id": item_id, "url": item.get("url", "")})
+    return {"ok": True, "status": "queued"}
+
+
+def transcript_worker() -> None:
+    while True:
+        with _TRANSCRIPT_LOCK:
+            if not _TRANSCRIPT["queue"]:
+                _TRANSCRIPT["worker"] = None
+                return
+            item = _TRANSCRIPT["queue"].pop(0)
+            _TRANSCRIPT["jobs"][item["id"]] = {"status": "running"}
+        try:
+            path = transcribe_radar_item(item)
+            job = {"status": "done", "path": path}
+        except Exception as exc:  # 下载、转写失败都记在条目上，页面显示原因
+            job = {"status": "failed", "error": str(exc)[:200]}
+        with _TRANSCRIPT_LOCK:
+            _TRANSCRIPT["jobs"][item["id"]] = job
+        log_operation({"action": "radar-transcript-" + job["status"], "id": item["id"], **job})
+
+
+def transcribe_radar_item(item: dict[str, object]) -> str:
+    capture = video_capture_module()
+    config_file = INGEST_DIR / "config.json"
+    config = json.loads(read_text(config_file)) if config_file.is_file() else {}
+    folder = VAULT / LAYOUT["video_clips_dir"]
+    folder.mkdir(parents=True, exist_ok=True)
+    item_id, url = str(item["id"]), str(item["url"])
+    short = hashlib.sha256(item_id.encode()).hexdigest()[:8]
+    existing = next(iter(sorted(folder.glob(f"*-{short}.md"))), None)
+    day = datetime.now().strftime("%Y-%m-%d")
+    safe = radar_module().safe_filename
+    captured = capture.capture(
+        url, folder, lambda name: existing.stem if existing else f"{day}-{safe(name)}-{short}", VAULT, config
+    )
+    title = captured["title"]
+    fans = item.get("fans")
+    lines = [
+        "---",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        f"source_url: {json.dumps(url, ensure_ascii=False)}",
+        f"created_at: {json.dumps(datetime.now().astimezone().isoformat(timespec='seconds'))}",
+        "tags:",
+        "  - radar",
+        "capture_source: radar",
+        f"radar_id: {json.dumps(item_id)}",
+        "processing_status: transcript-only",
+        "fetch_status: success",
+        f"content_type: {json.dumps(captured['content_type'])}",
+        *[f"{key}: {json.dumps(str(value), ensure_ascii=False)}" for key, value in captured["meta"].items()],
+        *([f"author_fans: {json.dumps(str(fans))}"] if fans is not None else []),
+        "---",
+        "",
+        f"# {title}",
+        "",
+        f"原链接：{url}",
+        "",
+        f"> 来自选题洞察「取文案」：账号粉丝 {fans if fans is not None else '未知'}，只出文案，不出素材卡。",
+        "",
+        captured["body"],
+    ]
+    path = folder / f"{captured['stem']}.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return relative(path)
+
+
+def radar_action(item_id: str, action: str, angle: str, block_author: bool) -> dict[str, object]:
+    radar = radar_module()
+    if action == "adopt":
+        result = radar.adopt_item(
+            item_id,
+            angle,
+            vault=VAULT,
+            topics_dir=LAYOUT["topics_dir"],
+            attention_days=TOPIC_ATTENTION_DAYS,
+        )
+    elif action in {"reject", "seen", "restore"}:
+        result = radar.mark_item(item_id, action, block_author=block_author)
+    else:
+        raise ValueError("操作不存在")
+    log_operation({"op": f"radar-{action}", "id": item_id, **({"candidate": result.get("candidate")} if action == "adopt" else {})})
+    return result
+
+
+def start_radar_run() -> dict[str, object]:
+    if radar_run_running():
+        raise ValueError("雷达正在抓取，请等它跑完")
+    if not RADAR_SCRIPT.is_file():
+        raise ValueError("没有安装爆款雷达")
+    env = {**os.environ, "RAYS_BRAIN_STATE": str(STATE_HOME)}
+    log_dir = STATE_HOME / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with (log_dir / "radar-run.log").open("a", encoding="utf-8") as handle:
+        handle.write(f"\n===== 工作台手动抓取 {started_at} =====\n")
+        handle.flush()
+        proc = subprocess.Popen(
+            [sys.executable, "-X", "utf8", str(RADAR_SCRIPT), "fetch"],
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(RADAR_SCRIPT.parent),
+        )
+    _RADAR["proc"] = proc
+    _RADAR["started_at"] = started_at
+    log_operation({"op": "radar-run", "started_at": started_at})
+    return {"ok": True, "started_at": started_at}
+
+
+def resolve_pipeline_error(at: str, message: str) -> dict[str, object]:
+    """在管线状态里标记一条错误已解决。与 30 分钟任务并发写有极小竞态，原子替换兜底。"""
+    state_file = STATE_HOME / "state.json"
+    try:
+        data = json.loads(read_text(state_file))
+    except (OSError, json.JSONDecodeError):
+        raise ValueError("找不到管线状态文件")
+    for item in data.get("errors", []):
+        if (
+            not item.get("resolved_at")
+            and str(item.get("at", "")) == at
+            and str(item.get("message", "")) == message
+        ):
+            item["resolved_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            item["resolved_by"] = "dashboard"
+            atomic_write(state_file, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            log_operation({"op": "resolve-error", "at": at, "message": message[:120]})
+            return {"ok": True}
+    raise ValueError("这条错误已经处理过了，刷新看看")
+
+
+INTENT_ACTIONS = {"draft": "起草"}
+INTENT_QUEUE_HEADER = """---
+kind: ai-task-queue
+---
+
+# AI 任务队列
+
+工作台排入的 AI 协作请求。用 Claude Code（/ray）处理：完成一条勾掉一条，并把产物链接补在行尾。此文件由工作台追加，人工可随时编辑。
+
+## 待处理
+"""
+
+
+def pending_intents(limit: int = 20) -> list[str]:
+    text = try_read(INTENT_QUEUE_FILE)
+    if not text:
+        return []
+    items = [
+        line[6:].strip()
+        for line in text.splitlines()
+        if line.startswith("- [ ] ")
+    ]
+    return items[-limit:]
+
+
+def queue_intent(rel_path: str, action: str) -> dict[str, object]:
+    label = INTENT_ACTIONS.get(action)
+    if not label:
+        raise ValueError("不支持这类 AI 请求")
+    path = vault_note_path(rel_path)
+    rel = relative(path)
+    if not rel.startswith(area_prefix("writing_tasks_dir")):
+        raise ValueError("目前只支持给写作任务排队起草")
+    marker = f"[[{rel[:-3]}]]"
+    text = try_read(INTENT_QUEUE_FILE) or ""
+    for line in text.splitlines():
+        if line.startswith("- [ ] ") and marker in line and label in line:
+            raise ValueError("这篇已经在队列里等着了")
+    if not text.strip():
+        text = INTENT_QUEUE_HEADER
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    entry = f"- [ ] {stamp} · {label} · {marker}"
+    atomic_write(INTENT_QUEUE_FILE, text.rstrip() + "\n" + entry + "\n")
+    log_operation({"op": "intent", "path": rel, "action": action})
+    return {"ok": True, "queued": entry, "queue_path": relative(INTENT_QUEUE_FILE)}
+
+
+TASK_NOTE_KINDS = {"writing-task", "content-task", "content-pack"}
+TASK_INACTIVE_STATUSES = {"published", "cancelled", "completed", "archived", "closed"}
+_DRAFT_RUN: dict[str, object] = {"proc": None, "started_at": "", "target": ""}
+
+
+def draft_run_running() -> bool:
+    proc = _DRAFT_RUN["proc"]
+    return proc is not None and proc.poll() is None  # type: ignore[union-attr]
+
+
+def start_draft_run(rel_path: str) -> dict[str, object]:
+    """后台派生 Codex 起草 worker：工作台只触发和展示，不在请求线程里等它。"""
+    if draft_run_running():
+        raise ValueError(f"已有一篇在起草中（{_DRAFT_RUN['target']}），请等它完成")
+    path = vault_note_path(rel_path)
+    rel = relative(path)
+    if not rel.startswith(area_prefix("writing_tasks_dir")):
+        raise ValueError("只能对写作任务发起起草")
+    meta = parse_frontmatter(read_text(path))
+    if meta.get("kind") not in TASK_NOTE_KINDS:
+        raise ValueError("这篇笔记不是写作任务")
+    if meta.get("status", "").strip() in TASK_INACTIVE_STATUSES:
+        raise ValueError(f"任务状态是 {meta.get('status')}，不需要起草")
+    if not DRAFT_WORKER_SCRIPT.is_file():
+        raise ValueError("找不到起草执行器脚本")
+    env = {**os.environ, "RAYS_BRAIN": str(VAULT), "RAYS_BRAIN_STATE": str(STATE_HOME)}
+    log_dir = STATE_HOME / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with (log_dir / "ai-draft.log").open("a", encoding="utf-8") as handle:
+        handle.write(f"\n===== 工作台发起起草 {started_at} · {rel} =====\n")
+        handle.flush()
+        proc = subprocess.Popen(
+            [sys.executable, "-X", "utf8", str(DRAFT_WORKER_SCRIPT), rel],
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(DRAFT_WORKER_SCRIPT.parent),
+        )
+    _DRAFT_RUN["proc"] = proc
+    _DRAFT_RUN["started_at"] = started_at
+    _DRAFT_RUN["target"] = rel
+    log_operation({"op": "draft-run", "path": rel, "started_at": started_at})
+    return {"ok": True, "started_at": started_at, "target": rel}
+
+
+# ray-kb 生成的口播稿写 koubo-draft，模板写 oral-script，两者同义。
+ORAL_SCRIPT_KINDS = frozenset({"oral-script", "koubo-draft"})
+PUBLISH_PLATFORMS = ("x", "wechat", "shipinhao", "douyin", "xiaohongshu")
+PUBLISH_ARCHIVE_RULES = {
+    # 草稿 kind → (正式稿子目录, 正式稿 kind)
+    "draft": (LAYOUT["published_articles_dir"], "article-published"),
+    "article-draft": (LAYOUT["published_articles_dir"], "article-published"),
+    **{kind: (LAYOUT["published_videos_dir"], "video-published") for kind in ORAL_SCRIPT_KINDS},
+}
+
+
+def wikilink_body(value: str) -> str:
+    match = re.match(r"\s*\[\[([^\]|#]+)", value or "")
+    return match.group(1).strip() if match else ""
+
+
+def find_published_by_content_id(content_id: str) -> Path | None:
+    if not content_id:
+        return None
+    root = VAULT / LAYOUT["published_dir"]
+    feedback_prefix = area_prefix("feedback_dir")
+    if not root.exists():
+        return None
+    for path in root.rglob("*.md"):
+        if relative(path).startswith(feedback_prefix):
+            continue
+        text = try_read(path)
+        if text is None:
+            continue
+        if parse_frontmatter(text).get("content_id", "") == content_id:
+            return path
+    return None
+
+
+def record_publication(
+    rel_path: str, platform: str, url: str, published_at: str
+) -> dict[str, object]:
+    """登记一次已完成的公开发布，并让发布归档脚本统一完成整条链的收尾。"""
+    if platform not in PUBLISH_PLATFORMS:
+        raise ValueError("不支持这个平台")
+    url = url.strip()
+    published_at = published_at.strip()
+    path = vault_note_path(rel_path)
+    rel = relative(path)
+    meta = parse_frontmatter(read_text(path))
+    published_prefix = area_prefix("published_dir")
+    created_article = False
+    if rel.startswith(published_prefix):
+        article = path
+    else:
+        rule = PUBLISH_ARCHIVE_RULES.get(meta.get("kind", ""))
+        if rule is None:
+            raise ValueError("只能对草稿或 40-发布 里的正式稿登记发布")
+        article = find_published_by_content_id(meta.get("content_id", ""))
+        if article is None:
+            subdir, published_kind = rule
+            target = VAULT / subdir / path.name
+            if target.exists():
+                raise ValueError(
+                    f"{subdir} 已有同名文件但 content_id 对不上，请先人工确认再登记"
+                )
+            text = update_frontmatter_text(
+                read_text(path),
+                {
+                    "kind": published_kind,
+                    "status": "published",
+                    "draft_source": f"[[{rel[:-3]}]]",
+                },
+            )
+            atomic_write(target, text)
+            article = target
+            created_article = True
+        else:
+            # 旧正式稿可能早于 draft_source/content_pack 这两个字段出现。先把来源链补齐，
+            # 后面的统一收尾才能移动真正的母稿和成稿包，而不是只登记平台链接。
+            article_text = read_text(article)
+            article_meta = parse_frontmatter(article_text)
+            link_updates: dict[str, str] = {}
+            if not wikilink_body(article_meta.get("draft_source", "")):
+                link_updates["draft_source"] = f"[[{rel[:-3]}]]"
+            if meta.get("content_pack", "") and not wikilink_body(
+                article_meta.get("content_pack", "")
+            ):
+                link_updates["content_pack"] = meta["content_pack"]
+            if link_updates:
+                atomic_write(article, update_frontmatter_text(article_text, link_updates))
+    if not RECORD_SCRIPT.is_file():
+        raise ValueError("找不到发布归档脚本")
+    env = {**os.environ, "RAYS_BRAIN": str(VAULT)}
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable, "-X", "utf8",
+                str(RECORD_SCRIPT),
+                "--article",
+                relative(article),
+                "--platform",
+                platform,
+                "--url",
+                url,
+                "--published-at",
+                published_at,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            cwd=str(RECORD_SCRIPT.parent),
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("登记超时，请稍后在终端重试")
+    if completed.returncode != 0:
+        lines = [line.strip() for line in completed.stderr.splitlines() if line.strip()]
+        raise ValueError(f"登记失败：{(lines[-1] if lines else '未知错误')[:300]}")
+    report = [line.rstrip() for line in completed.stdout.splitlines()]
+    log_operation(
+        {
+            "op": "record-publish",
+            "path": rel,
+            "article": relative(article),
+            "platform": platform,
+            "url": url,
+            "created_article": created_article,
+        }
+    )
+    return {
+        "ok": True,
+        "article": relative(article),
+        "created_article": created_article,
+        "updated": [],
+        "report": report[-30:],
+    }
+
+
+def pipeline_status() -> dict[str, object]:
+    runtime = load_runtime_state()
+    errors = [
+        {
+            "at": str(item.get("at", "")),
+            "message": str(item.get("message", "")),
+        }
+        for item in runtime.get("errors", [])
+        if not item.get("resolved_at")
+    ]
+    try:
+        last_activity = (
+            datetime.fromtimestamp((STATE_HOME / "state.json").stat().st_mtime)
+            .astimezone()
+            .isoformat(timespec="minutes")
+        )
+    except OSError:
+        last_activity = ""
+    tail: list[str] = []
+    try:
+        tail = (
+            (STATE_HOME / "logs" / PIPELINE_LOG_FILE_NAME)
+            .read_text(encoding="utf-8", errors="replace")
+            .splitlines()[-40:]
+        )
+    except OSError:
+        pass
+    source_health = runtime.get("source_health", {})
+    degraded_sources = [
+        {
+            "source": str(key),
+            "label": str(value.get("label", key)),
+            "consecutive_failures": int(value.get("consecutive_failures", 0) or 0),
+            "last_failure_at": str(value.get("last_failure_at", "")),
+            "message": str(value.get("message", "")),
+        }
+        for key, value in source_health.items()
+        if isinstance(value, dict) and value.get("status") == "degraded"
+    ]
+    return {
+        "ok": True,
+        "last_activity": last_activity,
+        "pending_sources": len(runtime.get("pending_sources", [])),
+        "errors": errors[-20:],
+        "source_health": source_health,
+        "degraded_sources": degraded_sources,
+        "log_tail": tail,
+        "manual_run_running": manual_run_running(),
+        "manual_run_started_at": str(_MANUAL_RUN["started_at"]),
+        "draft_run_running": draft_run_running(),
+        "draft_run_target": str(_DRAFT_RUN["target"]) if draft_run_running() else "",
+        "draft_run_started_at": str(_DRAFT_RUN["started_at"]) if draft_run_running() else "",
+        "intents": pending_intents(),
+        "intent_queue_path": relative(INTENT_QUEUE_FILE) if INTENT_QUEUE_FILE.exists() else "",
+    }
+
+
+def request_host(raw: str) -> str:
+    """从 Host 头取出主机名，兼容 `[IPv6]:端口` 与 `主机:端口` 两种写法。"""
+    value = (raw or "").strip().lower()
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    return value.split(":", 1)[0]
+
+
+def is_tailnet_address(value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return addr in TAILNET_V4 or addr in TAILNET_V6
+
+
+def detect_tailnet_identity() -> tuple[list[str], str | None]:
+    """通过 Tailscale CLI 读取本机 tailnet 地址与 MagicDNS 名；读不到就返回空。"""
+    for cli in TAILSCALE_CLI_CANDIDATES:
+        if not Path(cli).exists():
+            continue
+        try:
+            raw = subprocess.run(
+                [cli, "status", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            ).stdout
+            self_info = json.loads(raw).get("Self") or {}
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            continue
+        ips = [ip for ip in self_info.get("TailscaleIPs") or [] if is_tailnet_address(ip)]
+        dns_name = (self_info.get("DNSName") or "").rstrip(".").lower() or None
+        if ips:
+            return ips, dns_name
+    return [], None
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    server_version = "RaysBrainDashboard/1.0"
+
+    def log_message(self, format: str, *args: object) -> None:
+        if getattr(self.server, "quiet", False):
+            return
+        super().log_message(format, *args)
+
+    @staticmethod
+    def host_allowed(host: str) -> bool:
+        return host in LOCAL_HOSTS or host in EXTRA_ALLOWED_HOSTS or host.endswith(PONTE_SUFFIX)
+
+    def allowed_host(self) -> bool:
+        return self.host_allowed(request_host(self.headers.get("Host", "")))
+
+    def local_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        return self.host_allowed((parsed.hostname or "").lower())
+
+    def send_common_headers(self, content_type: str, length: int) -> None:
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+        )
+
+    def send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_common_headers(content_type, len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_media(self, path: Path) -> None:
+        """本地视频按 Range 分段送出，浏览器才能拖动进度条。"""
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        match = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
+        if match and (match.group(1) or match.group(2)):
+            if match.group(1):
+                start = int(match.group(1))
+                end = min(int(match.group(2)), size - 1) if match.group(2) else size - 1
+            else:
+                start = max(0, size - int(match.group(2)))
+            if start > end or start >= size:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            end = min(end, start + 8_388_607)  # 每段最多 8 MB
+            self.send_response(HTTPStatus.PARTIAL_CONTENT)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        else:
+            end = min(end, 8_388_607)
+            if end < size - 1:
+                self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            else:
+                self.send_response(HTTPStatus.OK)
+        length = end - start + 1
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_common_headers(MEDIA_TYPES[path.suffix.lower()], length)
+        self.end_headers()
+        with path.open("rb") as handle:
+            handle.seek(start)
+            self.wfile.write(handle.read(length))
+
+    def send_json(self, payload: object, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_bytes(body, "application/json; charset=utf-8", status)
+
+    def error_json(self, message: str, status: int = 400) -> None:
+        self.send_json({"ok": False, "error": message}, status)
+
+    def safe_handle(self, handler) -> None:
+        """任何一个请求出错都只影响自己：返回 JSON 错误，不中断服务。"""
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            traceback.print_exc()
+            try:
+                self.error_json("读取知识库时出错，请刷新重试", HTTPStatus.INTERNAL_SERVER_ERROR)
+            except OSError:
+                pass
+
+    def do_GET(self) -> None:
+        self.safe_handle(self.handle_get)
+
+    def do_POST(self) -> None:
+        self.safe_handle(self.handle_post)
+
+    def handle_get(self) -> None:
+        if not self.allowed_host():
+            self.error_json("仅允许从本机访问", HTTPStatus.FORBIDDEN)
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/healthz":
+            self.send_json(
+                {
+                    "ok": True,
+                    "vault": VAULT.name,
+                    "vault_path": str(VAULT),
+                    "review_enabled": bool(ACTION_LABELS),
+                }
+            )
+            return
+        if parsed.path == "/api/dashboard":
+            self.send_json(dashboard_payload())
+            return
+        if parsed.path == "/api/search":
+            params = parse_qs(parsed.query)
+            query = params.get("q", [""])[0]
+            scope = params.get("scope", ["all"])[0]
+            self.send_json({"query": query, "results": search_notes(query, scope)})
+            return
+        if parsed.path == "/api/note":
+            params = parse_qs(parsed.query)
+            try:
+                self.send_json(
+                    note_payload(
+                        params.get("path", [""])[0], params.get("link", [""])[0]
+                    )
+                )
+            except ValueError as exc:
+                self.error_json(str(exc), HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/videos":
+            self.send_json(videos_payload())
+            return
+        if parsed.path == "/api/video":
+            params = parse_qs(parsed.query)
+            try:
+                self.send_json(video_payload(params.get("path", [""])[0]))
+            except ValueError as exc:
+                self.error_json(str(exc), HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/pipeline":
+            self.send_json(pipeline_status())
+            return
+        if parsed.path == "/api/account/jobs":
+            self.send_json(account_service.payload())
+            return
+        if parsed.path == "/api/account/feishu":
+            self.send_json({"cards": account_service.feishu_cards()})
+            return
+        if parsed.path in {"/api/embed", "/api/query"}:
+            params = parse_qs(parsed.query)
+            try:
+                if parsed.path == "/api/embed":
+                    self.send_json(embed_payload(params.get("link", [""])[0]))
+                else:
+                    self.send_json(query_payload(params.get("q", [""])[0]))
+            except ValueError as exc:
+                self.error_json(str(exc), HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/media":
+            params = parse_qs(parsed.query)
+            try:
+                media = media_file(params.get("path", [""])[0], params.get("field", ["video_file"])[0])
+            except ValueError as exc:
+                self.error_json(str(exc), HTTPStatus.NOT_FOUND)
+                return
+            self.send_media(media)
+            return
+        if parsed.path == "/api/asset":
+            params = parse_qs(parsed.query)
+            try:
+                asset = find_asset(
+                    params.get("path", [""])[0], params.get("link", [""])[0]
+                )
+            except ValueError as exc:
+                self.error_json(str(exc), HTTPStatus.NOT_FOUND)
+                return
+            self.send_bytes(asset.read_bytes(), ASSET_TYPES[asset.suffix.lower()])
+            return
+        if parsed.path == "/api/radar":
+            self.send_json(radar_payload())
+            return
+        if parsed.path == "/api/radar/cover":
+            params = parse_qs(parsed.query)
+            try:
+                data, content_type = radar_module().cover_bytes(params.get("id", [""])[0])
+            except ValueError as exc:
+                self.error_json(str(exc), HTTPStatus.NOT_FOUND)
+                return
+            self.send_bytes(data, content_type)
+            return
+        if parsed.path == "/api/events":
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.stream_events()
+            return
+        static_map = {
+            # 工作台界面（本机改）：首页换成 ai.html，原界面留在 /classic
+            "/": ("ai.html", "text/html; charset=utf-8"),
+            "/ai.css": ("ai.css", "text/css; charset=utf-8"),
+            "/ai.js": ("ai.js", "text/javascript; charset=utf-8"),
+            "/fonts/MiSans-Regular.otf": ("fonts/MiSans-Regular.otf", "font/otf"),
+            "/fonts/MiSans-Medium.otf": ("fonts/MiSans-Medium.otf", "font/otf"),
+            "/fonts/MiSans-Semibold.otf": ("fonts/MiSans-Semibold.otf", "font/otf"),
+            "/fonts/MiSans-Heavy.otf": ("fonts/MiSans-Heavy.otf", "font/otf"),
+            "/classic": ("index.html", "text/html; charset=utf-8"),
+            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+            "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+            "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+            "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+        }
+        target = static_map.get(parsed.path)
+        if not target:
+            self.error_json("页面不存在", HTTPStatus.NOT_FOUND)
+            return
+        path = STATIC_DIR / target[0]
+        self.send_bytes(path.read_bytes(), target[1])
+
+    def stream_events(self) -> None:
+        """SSE：轮询关键位置的 mtime 指纹，变化时通知页面刷新。客户端断开即退出。"""
+        self.wfile.write(b"retry: 3000\n\n")
+        self.wfile.flush()
+        last = watch_signature()
+        while True:
+            time.sleep(2)
+            current = watch_signature()
+            if current != last:
+                time.sleep(1)  # 管线常一次写一批文件，等落定后只通知一次
+                last = watch_signature()
+                self.wfile.write(b"event: change\ndata: {}\n\n")
+            else:
+                self.wfile.write(b": keep-alive\n\n")
+            self.wfile.flush()
+
+    def handle_post(self) -> None:
+        if not self.allowed_host() or not self.local_origin():
+            self.error_json("仅允许从本机页面操作", HTTPStatus.FORBIDDEN)
+            return
+        if self.headers.get_content_type() != "application/json":
+            self.error_json("请求格式不正确", HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.error_json("请求长度不正确")
+            return
+        if length <= 0 or length > 1_048_576:
+            self.error_json("请求内容过长")
+            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.error_json("请求内容无法读取")
+            return
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/api/capture":
+                self.send_json(append_capture(str(payload.get("text", ""))))
+            elif parsed.path == "/api/reviews/action":
+                action = payload.get("action")
+                if action is not None:
+                    action = str(action)
+                self.send_json(choose_review_action(str(payload.get("path", "")), action))
+            elif parsed.path == "/api/topic-map-candidates/action":
+                self.send_json(
+                    choose_topic_map_candidate(
+                        str(payload.get("candidate_id", "")),
+                        str(payload.get("action", "")),
+                    )
+                )
+            elif parsed.path == "/api/note/transition":
+                expected = payload.get("expected_mtime_ns")
+                if expected is not None:
+                    try:
+                        expected = int(expected)
+                    except (TypeError, ValueError):
+                        raise ValueError("请求格式不正确")
+                self.send_json(
+                    apply_transition(
+                        str(payload.get("path", "")), str(payload.get("to", "")), expected
+                    )
+                )
+            elif parsed.path == "/api/promote":
+                self.send_json(
+                    promote_candidate(
+                        str(payload.get("path", "")), str(payload.get("angle", ""))
+                    )
+                )
+            elif parsed.path == "/api/note/save":
+                self.send_json(
+                    save_note_body(
+                        str(payload.get("path", "")),
+                        str(payload.get("body", "")),
+                        payload.get("expected_mtime_ns"),
+                    )
+                )
+            elif parsed.path == "/api/pipeline/resolve-error":
+                self.send_json(
+                    resolve_pipeline_error(
+                        str(payload.get("at", "")), str(payload.get("message", ""))
+                    )
+                )
+            elif parsed.path == "/api/pipeline/run":
+                self.send_json(start_manual_run())
+            elif parsed.path == "/api/account/preview":
+                try:
+                    self.send_json(account_service.preview(str(payload.get("url", ""))))
+                except ValueError as exc:
+                    self.error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            elif parsed.path == "/api/account/start":
+                try:
+                    mode = payload.get("mode")
+                    if not isinstance(mode, dict):
+                        mode = {}
+                    self.send_json(account_service.start(str(payload.get("url", "")), mode))
+                except ValueError as exc:
+                    self.error_json(str(exc), HTTPStatus.BAD_REQUEST)
+            elif parsed.path == "/api/reviews/apply":
+                # 本机改：只执行已勾选的审核选择（knowledge_ingest.py actions），不同步、不调 Codex
+                self.send_json(start_manual_run("actions"))
+            elif parsed.path == "/api/intent":
+                self.send_json(
+                    queue_intent(
+                        str(payload.get("path", "")), str(payload.get("action", ""))
+                    )
+                )
+            elif parsed.path == "/api/intent/execute":
+                self.send_json(start_draft_run(str(payload.get("path", ""))))
+            elif parsed.path == "/api/note/task":
+                self.send_json(
+                    toggle_task(
+                        str(payload.get("path", "")),
+                        payload.get("line"),
+                        bool(payload.get("checked")),
+                        payload.get("expected_mtime_ns"),
+                    )
+                )
+            elif parsed.path == "/api/feedback/metrics":
+                self.send_json(
+                    save_feedback_metrics(
+                        str(payload.get("path", "")),
+                        payload.get("values"),
+                        payload.get("expected_mtime_ns"),
+                    )
+                )
+            elif parsed.path == "/api/feedback/verdict":
+                self.send_json(
+                    record_feedback_verdict(
+                        str(payload.get("path", "")),
+                        str(payload.get("verdict", "")),
+                        str(payload.get("reason", "")),
+                    )
+                )
+            elif parsed.path == "/api/radar/action":
+                self.send_json(
+                    radar_action(
+                        str(payload.get("id", "")),
+                        str(payload.get("action", "")),
+                        str(payload.get("angle", "")),
+                        bool(payload.get("block_author")),
+                    )
+                )
+            elif parsed.path == "/api/radar/run":
+                self.send_json(start_radar_run())
+            elif parsed.path == "/api/radar/keywords":
+                self.send_json(save_radar_keywords(payload.get("douyin"), payload.get("xiaohongshu")))
+            elif parsed.path == "/api/radar/transcript":
+                self.send_json(start_radar_transcript(str(payload.get("id", ""))))
+            elif parsed.path == "/api/publish/record":
+                self.send_json(
+                    record_publication(
+                        str(payload.get("path", "")),
+                        str(payload.get("platform", "")),
+                        str(payload.get("url", "")),
+                        str(payload.get("published_at", "")),
+                    )
+                )
+            else:
+                self.error_json("操作不存在", HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self.error_json(str(exc))
+        except OSError:
+            self.error_json("写入失败，请确认 iCloud 文件已经下载到本机", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+class ThreadingHTTPServerV6(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def start_tailnet_listeners(port: int, quiet: bool) -> list[ThreadingHTTPServer]:
+    """在本机的 Tailscale 地址上加开入口，只有 tailnet 内的设备（如手机）能连到。"""
+    ips, dns_name = detect_tailnet_identity()
+    if not ips:
+        print("未检测到 Tailscale（未安装或未运行），手机入口未开启；本机访问不受影响。")
+        return []
+    EXTRA_ALLOWED_HOSTS.update(ip.lower() for ip in ips)
+    if dns_name:
+        EXTRA_ALLOWED_HOSTS.add(dns_name)
+    listeners: list[ThreadingHTTPServer] = []
+    for ip in ips:
+        server_cls = ThreadingHTTPServerV6 if ":" in ip else ThreadingHTTPServer
+        try:
+            listener = server_cls((ip, port), DashboardHandler)
+        except OSError as exc:
+            print(f"tailnet 地址 {ip} 监听失败（{exc}），已跳过。")
+            continue
+        listener.quiet = quiet
+        threading.Thread(target=listener.serve_forever, daemon=True).start()
+        listeners.append(listener)
+    if listeners:
+        phone_host = dns_name or ips[0]
+        print(f"手机入口（需连接 Tailscale）：http://{phone_host}:{port}")
+    return listeners
+
+
+def run_server(
+    host: str, port: int, open_browser: bool, quiet: bool = False, tailnet: bool = False
+) -> None:
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
+    server.quiet = quiet
+    url = f"http://{host}:{port}"
+    print(f"Ray's Brain 知识仪表盘：{url}")
+    tailnet_listeners = start_tailnet_listeners(port, quiet) if tailnet else []
+    print("按 Control+C 停止。")
+    if open_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n仪表盘已停止。")
+    finally:
+        server.server_close()
+        for listener in tailnet_listeners:
+            listener.server_close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ray's Brain 本地知识仪表盘")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", default=8765, type=int)
+    parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--tailnet",
+        action="store_true",
+        help="同时在本机的 Tailscale 地址上开手机入口（仅 tailnet 内设备可访问）",
+    )
+    args = parser.parse_args()
+    if args.host not in {"127.0.0.1", "localhost"}:
+        raise SystemExit("为保护私人笔记，仪表盘只允许监听本机地址；手机访问请用 --tailnet。")
+    run_server(args.host, args.port, not args.no_open, args.quiet, tailnet=args.tailnet)
+
+
+if __name__ == "__main__":
+    main()

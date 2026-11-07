@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "summary", "body_markdown", "facts_used", "open_questions"],
+  "properties": {
+    "title": { "type": "string" },
+    "summary": { "type": "string" },
+    "body_markdown": { "type": "string" },
+    "facts_used": { "type": "array", "items": { "type": "string" } },
+    "open_questions": { "type": "array", "items": { "type": "string" } }
+  }
+}

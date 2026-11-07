@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>内容中枢</title>
+<link rel="icon" href="/favicon.svg">
+<link rel="stylesheet" href="/ai.css">
+<script src="/ai.js" defer></script>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <a class="brand" href="#today"><div class="mark">文</div><div><b>内容工作台</b><small>第二大脑 · 选题到复盘</small></div></a>
+    <nav class="nav" id="nav">
+      <span class="nav-pill" id="navPill"></span>
+      <a href="#today" data-view="today">概览</a>
+      <a href="#review" data-view="review">甄选<span class="n" id="navReview">–</span></a>
+      <a href="#board" data-view="board">进程<span class="n" id="navBoard">–</span></a>
+      <a href="#radar" data-view="radar">选题洞察<span class="n" id="navRadar">–</span></a>
+      <a href="#videos" data-view="videos">视频文案<span class="n" id="navVideos">–</span></a>
+    </nav>
+    <form class="search" id="searchForm" autocomplete="off">
+      <span class="ico">⌕</span>
+      <div class="ph-wrap"><input id="searchInput" type="text" aria-label="搜索笔记"><span class="ph" id="searchPh"></span></div>
+      <kbd>Ctrl K</kbd>
+      <div class="results" id="searchResults" hidden></div>
+    </form>
+    <a class="round" href="#today" id="bell" title="今天到期的事">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+      <span class="dot" id="bellDot" hidden></span>
+    </a>
+  </header>
+
+  <!-- 概览 -->
+  <main class="view" id="view-today">
+    <div class="head">
+      <h1>概览</h1>
+      <div class="sub" id="todayDate"></div>
+      <div class="act">
+        <button class="btn stateful" id="radarBtn" type="button"><span class="st-idle">↻ 刷新选题洞察</span><span class="st-load"><i class="spin"></i>拉取中…</span><span class="st-done" id="radarDone">✓ 完成</span></button>
+        <button class="btn primary" id="captureBtn" type="button">＋ 记下灵感</button>
+      </div>
+    </div>
+
+    <form class="capture" id="captureForm" hidden autocomplete="off">
+      <div class="ph-wrap big"><input id="captureInput" type="text" aria-label="记下灵感" maxlength="2000"><span class="ph" id="capturePh"></span><div class="vanish" id="vanish"></div></div>
+      <button class="btn primary" type="submit">记下</button>
+      <span class="cap-msg" id="captureMsg"></span>
+    </form>
+
+    <section class="grid row1">
+      <div class="card focus glow" id="focusCard">
+        <div class="lab"><i></i>今天先做这一件</div>
+        <h2 id="focusTitle">…</h2>
+        <p id="focusDesc"></p>
+        <div class="foot"><a class="go" id="focusGo" href="#">打开 →</a><span class="also" id="focusAlso"></span></div>
+      </div>
+      <div class="card stat glow" data-col="cand"><div class="k"><i class="c-cand"></i>候选选题</div><div class="v" id="sCand">–</div><div class="s" id="sCandS"></div></div>
+      <div class="card stat glow" data-col="writing"><div class="k"><i class="c-writing"></i>写作中</div><div class="v" id="sWriting">–</div><div class="s" id="sWritingS"></div></div>
+      <div class="card stat glow" data-col="recording"><div class="k"><i class="c-recording"></i>待录制</div><div class="v" id="sRecording">–</div><div class="s" id="sRecordingS"></div></div>
+      <div class="card stat glow" data-col="review"><div class="k"><i class="c-review"></i>待复盘</div><div class="v" id="sReview">–</div><div class="s" id="sReviewS"></div></div>
+    </section>
+
+    <section class="grid row2">
+      <div class="card">
+        <h3>东西停在哪一步<span class="hint">点一行去进程</span></h3>
+        <div class="pipe" id="pipe"></div>
+        <div class="note" id="pipeNote"></div>
+      </div>
+      <div class="card">
+        <h3 id="actName">活动</h3>
+        <div class="dial">
+          <svg width="180" height="180" viewBox="0 0 180 180">
+            <circle cx="90" cy="90" r="70" fill="none" class="ring-bg" stroke-width="14"/>
+            <circle cx="90" cy="90" r="70" fill="none" class="ring-fg" stroke-width="14" stroke-linecap="round" id="ring" transform="rotate(-90 90 90)"/>
+          </svg>
+          <div class="t"><div class="num" id="actDays">–</div><span>天后截止</span></div>
+        </div>
+        <div class="kv"><span id="actRange"></span><b id="actPub"></b></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>选题洞察 · 和我们方向相关的低粉爆款<span class="hint">爆款指数 = 互动量 ÷ 账号粉丝</span></h3>
+      <div class="hz" id="radarTodayZone"><span class="hl"></span><table><thead><tr><th>内容</th><th>平台</th><th>账号粉丝</th><th>获赞</th><th>爆款指数</th><th>命中词</th><th></th></tr></thead><tbody id="radarToday"></tbody></table></div>
+      <div class="foot-note"><span id="radarMeta"></span><a href="#radar">看全部 →</a></div>
+    </section>
+  </main>
+
+  <!-- 甄选 -->
+  <main class="view" id="view-review" hidden>
+    <div class="head">
+      <h1>甄选</h1>
+      <div class="sub">逐条甄选，留存有价值的素材</div>
+      <div class="act">
+        <button class="btn stateful" id="applyBtn" type="button"><span class="st-idle" id="applyIdle">执行</span><span class="st-load"><i class="spin"></i>执行中…</span><span class="st-done" id="applyDone">✓ 已执行</span></button>
+      </div>
+    </div>
+    <section class="grid rv-grid">
+      <div class="card rv-card" id="rvCard">
+        <div class="rv-empty" id="rvEmpty" hidden>
+          <div class="rv-empty-ico">✓</div>
+          <h3>暂无待甄选的素材卡</h3>
+          <p>新资料收录、AI 写好素材卡后会出现在这里。把链接丢进「记下灵感」就会进收件箱。</p>
+        </div>
+        <div id="rvBody">
+          <div class="rv-top"><div class="rv-badges" id="rvBadges"></div><span class="rv-count" id="rvCount"></span></div>
+          <h2 class="rv-title"><a id="rvTitle" href="#" title="在 Obsidian 打开素材卡"></a></h2>
+          <p class="rv-summary" id="rvSummary"></p>
+          <div class="rv-sec"><h4>观众看完能做什么</h4><p id="rvReader"></p></div>
+          <div class="rv-sec"><h4>可写角度</h4><ul id="rvAngles"></ul></div>
+          <div class="rv-sec rv-muted"><h4>漏洞与反例</h4><ul id="rvHoles"></ul></div>
+          <div class="rv-src" id="rvSrc"></div>
+          <div class="rv-actions" id="rvActions"></div>
+          <div class="rv-keys">1～5 选择 · J / K 上一张下一张 · U 撤回刚才那张 · O 打开原文</div>
+        </div>
+      </div>
+      <div class="rv-side">
+        <div class="card"><h3>待甄选<span class="hint" id="rvPendN"></span></h3><div class="hz rv-list" id="rvPendZone"><span class="hl"></span><div id="rvPend"></div></div></div>
+        <div class="card"><h3>待执行<span class="hint" id="rvQueueN"></span></h3><div class="hz rv-list" id="rvQueueZone"><span class="hl"></span><div id="rvQueue"></div></div>
+          <p class="rv-tip">点右上角「执行」后才会写入知识库或候选选题，执行前可随时撤回。这一步不调用 Codex，不产生费用。</p></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 进程 -->
+  <main class="view" id="view-board" hidden>
+    <div class="head">
+      <h1>进程</h1>
+      <div class="sub">一张卡片一件事，从左往右推</div>
+    </div>
+    <section class="grid board" id="board"></section>
+  </main>
+
+  <!-- 选题洞察 -->
+  <main class="view" id="view-radar" hidden>
+    <div class="head">
+      <h1>选题洞察</h1>
+      <div class="sub" id="radarSub"></div>
+      <div class="act"><button class="btn" id="kwBtn" type="button">⚙ 搜索关键词</button><button class="btn stateful" id="radarBtn2" type="button"><span class="st-idle">↻ 刷新选题洞察</span><span class="st-load"><i class="spin"></i>拉取中…</span><span class="st-done" id="radarDone2">✓ 完成</span></button></div>
+    </div>
+    <!-- 本机加（11-02）：搜索关键词管理。刷新时拿这些词去抖音低粉爆款榜、小红书搜索找爆款 -->
+    <section class="card kw-panel" id="kwPanel" hidden>
+      <div class="kw-row"><b>抖音</b><div class="kw-chips" id="kwDouyin"></div><form class="kw-add" data-p="douyin" autocomplete="off"><input type="text" maxlength="20" placeholder="加一个词，回车"><button class="btn sm" type="submit">添加</button></form></div>
+      <div class="kw-row"><b>小红书</b><div class="kw-chips" id="kwXhs"></div><form class="kw-add" data-p="xiaohongshu" autocomplete="off"><input type="text" maxlength="20" placeholder="加一个词，回车"><button class="btn sm" type="submit">添加</button></form></div>
+      <div class="kw-foot"><span id="kwEst"></span><button class="btn sm ghost" id="kwCancel" type="button">取消</button><button class="btn sm primary" id="kwSave" type="button">保存</button></div>
+    </section>
+    <div class="vd-bar">
+    <div class="filters" id="radarFilters">
+      <span class="on" data-f="ours">和我们相关</span><span data-f="latest">本次新增</span><span data-f="douyin">抖音</span><span data-f="xiaohongshu">小红书</span><span data-f="adopted">已列入</span>
+    </div>
+    <div class="filters sort" id="radarSort"><em>排序</em><span class="on" data-s="mult">爆款指数</span><span data-s="time">发布时间</span><span data-s="likes">获赞</span></div>
+    </div>
+    <section class="card">
+      <div class="hz" id="radarAllZone"><span class="hl"></span><table><thead><tr><th>内容</th><th>平台</th><th>账号粉丝</th><th>获赞</th><th>爆款指数</th><th>命中词</th><th></th></tr></thead><tbody id="radarAll"></tbody></table></div>
+    </section>
+  </main>
+
+  <!-- 视频文案（本机加，10-28）：飞书群或链接收件箱里的抖音、小红书链接，下载转写后都在这里 -->
+  <main class="view" id="view-videos" hidden>
+    <div class="head">
+      <h1>视频文案</h1>
+      <div class="sub" id="vdSub"></div>
+      <div class="act"><button class="btn primary stateful" id="ingestBtn" type="button" title="马上去已配置的飞书群拉新链接，下载转写，不等 30 分钟的定时收录"><span class="st-idle">⇣ 立即收录飞书群</span><span class="st-load"><i class="spin"></i><span id="ingestLoad">收录中…</span></span><span class="st-done" id="ingestDone">✓ 完成</span></button><button class="btn" id="acctBtn" type="button" title="收录一个抖音博主的全部作品（发主页名片），并自动写账号拆解初稿">收录博主</button></div>
+    </div>
+    <div class="vd-bar">
+      <div class="filters" id="vdFilters"><span class="on" data-f="all">全部</span><span data-f="douyin">抖音</span><span data-f="xiaohongshu">小红书</span></div>
+      <input class="vd-q" id="vdQ" type="search" placeholder="按标题或作者筛" autocomplete="off" aria-label="按标题或作者筛">
+    </div>
+    <div class="vd-acct" id="acctStrip" hidden><b id="acctTitle">博主收录</b><span id="acctDetail"></span></div>
+    <section class="grid vd-grid">
+      <div class="card vd-listcard"><div class="hz" id="vdListZone"><span class="hl"></span><div id="vdList"></div></div></div>
+      <div class="card vd-card" id="vdCard"><div class="vd-empty">还没有视频文案。把抖音、小红书链接发到已配置的飞书群，下载转写好后会出现在这里。</div></div>
+    </section>
+  </main>
+
+  <div class="modal-scrim" id="acctScrim" hidden></div>
+  <div class="acct-dialog" id="acctDlg" hidden>
+    <h3>收录博主</h3>
+    <p class="hint">粘贴抖音博主主页（名片）链接，或从飞书群最近收到的名片里选。</p>
+    <div class="acct-feishu" id="acctFeishu"></div>
+    <input id="acctUrl" type="text" placeholder="抖音或小红书博主主页链接（v.douyin.com / xhslink.cn 均可）">
+    <div class="acct-row"><button class="btn" id="acctPreviewBtn" type="button">查看数量</button></div>
+    <div class="acct-preview" id="acctPreview"></div>
+    <div class="acct-mode">
+      <label><input type="radio" name="acctMode" value="all" checked> 全部</label>
+      <label><input type="radio" name="acctMode" value="recent"> 最近 <input id="acctN" type="number" min="1" value="30"> 条</label>
+      <label><input type="radio" name="acctMode" value="top"> 点赞最高 <input id="acctNTop" type="number" min="1" value="10"> 条</label>
+    </div>
+    <div class="acct-actions"><button class="btn ghost" id="acctCancel" type="button">取消</button><button class="btn primary" id="acctStart" type="button">开始收录</button></div>
+  </div>
+
+  <footer class="foot-bar"><span>本地运行 · 数据就是你知识库里的 Markdown</span></footer>
+</div>
+<div class="toast" id="toast" hidden></div>
+</body>
+</html>
